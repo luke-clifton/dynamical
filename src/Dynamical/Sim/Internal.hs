@@ -70,11 +70,37 @@ instance Applicative (Signal t) where
 
 instance Num a => Num (Signal t a) where
     fromInteger = pure . fromInteger
-    a + b = (+) <$> a <*> b
-    a * b = (*) <$> a <*> b
-    abs a = abs <$> a
-    signum a = signum <$> a
-    negate a = negate <$> a
+    (+) = liftA2 (+)
+    (*) = liftA2 (*)
+    abs = fmap abs
+    signum = fmap signum
+    negate = fmap negate
+
+instance Fractional a => Fractional (Signal t a) where
+    (/) = liftA2 (/)
+    recip = fmap recip
+    fromRational = pure . fromRational
+
+instance Floating a => Floating (Signal t a) where
+    pi = pure pi
+    exp = fmap exp
+    log = fmap log
+    sqrt = fmap sqrt
+    (**) = liftA2 (**)
+    logBase = liftA2 (**)
+    sin = fmap sin
+    cos = fmap cos
+    tan = fmap tan
+    asin = fmap asin
+    acos = fmap acos
+    atan = fmap atan
+    sinh = fmap sinh
+    cosh = fmap cosh
+    tanh = fmap tanh
+    asinh = fmap asinh
+    acosh = fmap acosh
+    atanh = fmap atanh
+
 
 -------------------------------------------------------------------
 -- Event
@@ -287,6 +313,9 @@ addSim n (Sim s) = runState s n
 -- Once we determine which solution to go for, we should integrate it
 -- more with the rest of the code such that sharing caries over to
 -- events.
+--
+-- It's probably worth redefining `share` to `id` when not using sharing
+-- or using implicit sharing.
 evalSignal'
     :: forall t o a. (Time t)
     => Network t o -> Signal t a -> State (IntMap (StableName Prim.Any, Any)) a
