@@ -28,6 +28,7 @@ library
     Chart >=1.8 && <1.9,
     Chart-diagrams >=1.8 && <1.9,
     linear,
+    scientific,
     stable-memo,
     time,
     vector

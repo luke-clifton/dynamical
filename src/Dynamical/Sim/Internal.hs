@@ -30,6 +30,7 @@ import Data.List
 import Data.Maybe
 import Data.Monoid (Monoid(), Any(Any), (<>), mempty, mappend)
 import Data.Proxy (Proxy(Proxy))
+import Data.Scientific (Scientific)
 import Data.StableMemo (memo)
 import Data.Time (getCurrentTime, diffUTCTime, UTCTime)
 import qualified Data.Vector as V
@@ -79,6 +80,7 @@ instance Num a => Num (Signal t a) where
 -- Event
 -------------------------------------------------------------------
 
+-- | An `Event t a` represents a series of instantaneous events.
 data Event t a where
     ERoot  :: (Num a, Ord a) => Signal t a -> Event t ()
     ETag   :: Event t a -> Signal t b -> Event t (a,b)
@@ -96,6 +98,7 @@ instance Functor (Event t) where
 -- Sim
 -------------------------------------------------------------------
 
+-- | The `Sim t` monad is used for constructing certain `Signal` values.
 newtype Sim t a = Sim {unSim :: forall o. State (Network t o) a}
 
 instance Functor (Sim t) where
@@ -118,18 +121,23 @@ instance MonadFix (Sim t) where
 -- Network
 -------------------------------------------------------------------
 
+-- | This type family is used for determining the best way to store
+-- a vector of values. It should evaluate to something that is an
+-- instance of @Data.Vector.Generic.Vector@.
 type family NetStoreVec a :: * -> *
 type instance NetStoreVec Double = UV.Vector
 type instance NetStoreVec Float = UV.Vector
 type instance NetStoreVec Word = UV.Vector
 type instance NetStoreVec Int = UV.Vector
 type instance NetStoreVec (Fixed a) = V.Vector
+type instance NetStoreVec Scientific = V.Vector
 
 type NetStore t = NetStoreVec t t
 type NetStoreMut t = G.Mutable (NetStoreVec t) t
 
 type Time t = (G.Vector (NetStoreVec t) t, Show (NetStore t))
 
+-- | A `Network` represents a compiled simulation.
 data Network t o = Network
     { netIntState :: NetStore t
     , netIntDeriv :: IntMap (Signal t (NetStore t))
@@ -138,6 +146,9 @@ data Network t o = Network
     }
 
 -- TODO: Rewrite
+
+-- | Cleans up a `Network` after a switching event, removing signals
+-- that are no longer needed.
 gc :: forall v t o. Time t => Network t o -> Network t o
 gc n@Network{..} =
     let
@@ -420,6 +431,7 @@ instance Splat t (V4 t) where
 -- API
 -------------------------------------------------------------------
 
+-- | Integrate the input `Signal` with respect to time.
 integral :: (Splat t a, Time t) => a -> Signal t a -> Sim t (Signal t a)
 integral i s = Sim $ do
     st <- get
@@ -432,6 +444,9 @@ integral i s = Sim $ do
         }
     return $ SInt ix
 
+-- | Create a `Signal` that is a pure function of time. Each `timeFn'` has
+-- a local concept of time, and this time starts from the provided time
+-- value.
 timeFn' :: Time t => t -> (t -> a) -> Sim t (Signal t a)
 timeFn' t f = Sim $ do
     st <- get
@@ -442,52 +457,59 @@ timeFn' t f = Sim $ do
         }
     return $ SFn ix f
 
-switch :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
-switch s e = become s (fmap (\s' -> s' >>= \s'' -> pure (switch s'' e)) e)
-
-becomeOn :: Signal t a -> Event t b -> (b -> Sim t (Signal t a)) -> Signal t a
-becomeOn s e f = become s (fmap f e)
-
+-- | As `timeFn'` but local time starts at 0.
 timeFn :: (Time t, Num t) => (t -> a) -> Sim t (Signal t a)
 timeFn = timeFn' 0
 
+-- | Start out as the input `Signal`, but when the `Event` occurs, become
+-- the signal that it carries, and remain as that signal forever. Future
+-- `Event`s from this event source will be ignored. See `switch` for
+-- alternate behavior.
 become :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
 become = SSwitch
+
+-- | Start out as the input `Signal` and everytime the `Event` occurs, change
+-- to the new `Signal` carried in the `Event`. This can easily cause
+-- a space leak if used recursively. Look at `become` for a safer solution.
+switch :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
+switch s e = become s (fmap (\s' -> s' >>= \s'' -> pure (switch s'' e)) e)
+
+-- | Useful combination of `become` and `fmap`
+becomeOn :: Signal t a -> Event t b -> (b -> Sim t (Signal t a)) -> Signal t a
+becomeOn s e f = become s (fmap f e)
+
+-- | Turns the input `Signal t a` into a `Signal t (Maybe a)`, resulting
+-- in `Nothing` as soon as the `Event` fires, and remaining `Nothing` forever
+-- after that point.
+becomeNothingOn :: Signal t a -> Event t b -> Signal t (Maybe a)
+becomeNothingOn s e = becomeOn (fmap Just s) e $ \_ -> return $ pure Nothing
+
 
 -- | Memoize the result of evaluating this Signal so that repeated
 -- uses don't have to re-evaluate everything. Integrations are
 -- already shared by default, so avoid sharing them directly.
+--
+-- TODO: Depending on the signal evaluation strategy (see comments in code)
+-- sharing may implicitly happen for all signals, or not at all.
 share :: Signal t a -> Signal t a
 share = SShare
 
+-- | Emit an event every time the input `Signal` crosses 0.
 root :: (Ord t, Num t) => Signal t t -> Event t ()
 root = ERoot
 
+-- | Tag the given event with the value of the signal when it occurs.
 tag :: Event t a -> Signal t b -> Event t (a,b)
 tag  = ETag
-
-
-replace :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
-replace = SSwitch
-
-becomeNothingOn :: Signal t a -> Event t b -> Signal t (Maybe a)
-becomeNothingOn s e = becomeOn (fmap Just s) e $ \_ -> return $ pure Nothing
 
 -------------------------------------------------------------------
 -- Simulation
 -------------------------------------------------------------------
 
-simulateDouble
-    :: Integrator Double o
-    -> Sim Double (Signal Double o)
-    -> [(Double,Network Double o)]
-simulateDouble = simulate
-
-simulateJust :: (Num t, Time t) => Integrator t (Maybe o) -> Sim t (Signal t (Maybe o)) -> [(t,o)]
-simulateJust i s = fmap (\(t,Just x) -> (t,x)) $ takeWhile (isJust . snd) $ fmap evalRoot <$> simulate i s
-
-simulate :: forall v t o. (Num t, Time t) => Integrator t o -> Sim t (Signal t o) -> [(t,Network t o)]
-simulate integrator s =
+-- | Run the `Integrator` over the given `Signal` outputting a list of
+-- time stamp and `Network`s.
+simulate' :: forall v t o. (Num t, Time t) => Integrator t o -> Sim t (Signal t o) -> [(t,Network t o)]
+simulate' integrator s =
     let
         n = newSim s
     in unfoldr (\(i,n,t) ->
@@ -500,6 +522,34 @@ simulate integrator s =
                  )
         ) (integrator,n,0)
 
+-- | Run the `Integrator` over the given `Signal`, outputting a list of
+-- time stamp and signal values.
+simulate :: (Num t, Time t) => Integrator t o -> Sim t (Signal t o) -> [(t,o)]
+simulate i s = fmap evalRoot <$> simulate' i s
+
+-- | `simulate'` specialised to `Double`
+simulateDouble'
+    :: Integrator Double o
+    -> Sim Double (Signal Double o)
+    -> [(Double,Network Double o)]
+simulateDouble' = simulate'
+
+-- | `simulate` specialised to `Double`
+simulateDouble
+    :: Integrator Double o
+    -> Sim Double (Signal Double o)
+    -> [(Double,o)]
+simulateDouble = simulate
+
+-- | `simulate` which stops as soon as the `Signal` value becomes `Nothing`
+simulateJust :: (Num t, Time t) => Integrator t (Maybe o) -> Sim t (Signal t (Maybe o)) -> [(t,o)]
+simulateJust i s = fmap (\(t,Just x) -> (t,x)) $ takeWhile (isJust . snd) $ simulate i s
+
+-- | `simulateJust` specialised to `Double`
+simulateJustDouble :: Integrator Double (Maybe o) -> Sim Double (Signal Double (Maybe o)) -> [(Double,o)]
+simulateJustDouble = simulateJust
+
+-- | Run a simulation in real time, printing the result values to the terminal.
 runRk4RealTime :: forall a. Show a => Sim Double (Signal Double a) -> IO ()
 runRk4RealTime s =
     let
@@ -516,6 +566,7 @@ runRk4RealTime s =
         now <- getCurrentTime
         go now n
 
+-- | Same as `runRk4RealTime` but stops when a `Nothing` value is produced.
 runRk4RealTimeJust :: forall a. Show a => Sim Double (Signal Double (Maybe a)) -> IO ()
 runRk4RealTimeJust s =
     let
@@ -552,6 +603,8 @@ euler h = integrator
                 n' = deltaNet n h (G.map (*h) ds)
             in (runSwitches n n', h, integrator)
 
+-- | Same as `euler` except that it bisects around `Event`s until it is within
+-- the provided tolerance.
 eulerBisect :: (Fractional t, Ord t, Time t) => t -> t -> Integrator t o
 eulerBisect tol h = integrator
     where
@@ -627,6 +680,10 @@ ex4 = do
 
 -- Ex5 demonstrates using `Maybe` to terminate a simulation with
 -- `simulateJust`.
+--
+-- Note: The use of an `Event` rather than `fmap`ing over the signal
+-- causes the root finding algorithm of many integrators to kick in allowing
+-- for very precise finishing times.
 ex5 :: (Floating t, Time t, Ord t) => Sim t (Signal t (Maybe (V4 t)))
 ex5 = do
     i <- (integral 0 $ pure (V4 0 1 2 (-0.5)) )
