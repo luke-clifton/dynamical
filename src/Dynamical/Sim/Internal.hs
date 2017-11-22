@@ -1,5 +1,4 @@
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE IncoherentInstances #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -15,31 +14,36 @@
 
 module Dynamical.Sim.Internal where
 
-import Data.Complex
-import Data.Proxy
-import Data.Maybe
-import Data.Fixed
+import qualified GHC.Prim as Prim
+import Data.StableMemo
+import Unsafe.Coerce (unsafeCoerce)
 import Control.Applicative
-import Debug.Trace
-import Control.Monad.State
-import Control.Monad.Writer hiding (Any)
-import Data.List
-import qualified Data.IntMap.Strict as Map
+import Control.Monad
+import Control.Monad.Fix (MonadFix(mfix))
+import Control.Monad.State (StateT, State, get, put, runState, modify, execState, evalState)
+import Control.Monad.Trans (lift)
+import Control.Monad.Writer (Writer, tell, WriterT, runWriterT)
+import Data.Complex (Complex((:+)))
+import Data.Fixed (Fixed)
 import Data.IntMap.Strict (IntMap)
-import Data.Monoid hiding (Any)
-import qualified Data.Monoid as Monoid
-import Graphics.Rendering.Chart.Easy hiding (tan, Vector)
-import Graphics.Rendering.Chart.Backend.Diagrams
-import qualified Data.IntSet as Set
+import qualified Data.IntMap.Strict as Map
 import Data.IntSet (IntSet)
-import qualified Data.Vector.Unboxed as UV
-import qualified Data.Vector.Unboxed.Mutable as UM
+import qualified Data.IntSet as Set
+import Data.List
+import Data.Maybe
+import Data.Monoid (Monoid(), Any(Any), (<>), mempty, mappend)
+import Data.Proxy (Proxy(Proxy))
+import Data.Time (getCurrentTime, diffUTCTime, UTCTime)
+import qualified Data.Vector as V
 import qualified Data.Vector.Generic as G
 import qualified Data.Vector.Generic.Mutable as GM
-import qualified Data.Vector as V
 import qualified Data.Vector.Mutable as VM
-import Data.Time
-import Linear
+import qualified Data.Vector.Unboxed as UV
+import qualified Data.Vector.Unboxed.Mutable as UM
+import Debug.Trace
+import Linear (V1(..), V2(..), V3(..), V4(..), norm)
+import System.IO.Unsafe (unsafePerformIO)
+import System.Mem.StableName (hashStableName,eqStableName,StableName,makeStableName)
 
 -- TODO: Think about sharing.
 
@@ -50,6 +54,7 @@ data Signal t a where
     SInt    :: Splat t a => Int -> Signal t a
     SFn     :: Int -> (t -> a) -> Signal t a
     SSwitch :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
+    SShare  :: Signal t a -> Signal t a
 
 instance Functor (Signal t) where
     fmap = SMap
@@ -89,7 +94,7 @@ instance Functor (Event t) where
 
 newtype Sim t a = Sim {unSim :: forall o. State (Network t o) a}
 
-class Splat t a | a -> t where
+class Splat t a where
     splen :: Proxy t -> Proxy a -> Int
     splat :: Time t => a -> NetStore t
     unsplat :: Time t => NetStore t -> a
@@ -99,57 +104,43 @@ instance Splat t t where
     splat t = G.singleton t
     unsplat v = v G.! 0
 
-instance (Splat t a, Splat t b) => Splat t (a,b) where
-    splen t _ = splen t (Proxy :: Proxy t) + splen t (Proxy :: Proxy b)
+instance Splat t (t,t) where
+    splen t _ = 2
     splat (a,b) = splat a G.++ splat b
-    unsplat v =
-        let
-            (a,b) = G.splitAt (splen (Proxy :: Proxy t) (Proxy :: Proxy t)) v
-        in (unsplat a, unsplat b)
+    unsplat v = (v G.! 0, v G.! 1)
 
-instance (Splat t a, Splat t b, Splat t c) => Splat t (a,b,c) where
-    splen t _ = splen t (Proxy :: Proxy a) + splen t (Proxy :: Proxy (b,c))
-    splat (a,b,c) = splat a G.++ splat (b,c)
-    unsplat v =
-        let
-            (a,x) = G.splitAt (splen (Proxy :: Proxy t) (Proxy :: Proxy t)) v
-            (b,c) = unsplat x
-        in (unsplat a, b, c)
+instance Splat t (t,t,t) where
+    splen t _ = 3
+    splat (a,b,c) = G.fromList [a,b,c]
+    unsplat v = (v G.! 0, v G.! 1, v G.! 2)
 
-instance (Splat t a, Splat t b, Splat t c, Splat t d) => Splat t (a,b,c,d) where
-    splen t _ = splen t (Proxy :: Proxy a) + splen t (Proxy :: Proxy (b,c,d))
-    splat (a,b,c,d) = splat a G.++ splat (b,c,d)
-    unsplat v =
-        let
-            (a,x) = G.splitAt (splen (Proxy :: Proxy t) (Proxy :: Proxy t)) v
-            (b,c,d) = unsplat x
-        in (unsplat a, b, c, d)
+instance Splat t (t,t,t,t) where
+    splen t _ = 4
+    splat (a,b,c,d) = G.fromList [a,b,c,d]
+    unsplat v = (v G.! 0, v G.! 1, v G.! 2, v G.! 3)
 
-instance Splat t a => Splat t (Complex a) where
-    splen t _ = splen t (Proxy :: Proxy a) + splen t (Proxy :: Proxy a)
-    splat (a :+ b) = splat a G.++ splat b
-    unsplat v =
-        let
-            (a,b) = G.splitAt (splen (Proxy :: Proxy t) (Proxy :: Proxy a)) v
-        in unsplat a :+ unsplat b
+instance Splat t (Complex t) where
+    splen t _ = 2
+    splat (a :+ b) = G.fromList [a,b]
+    unsplat v = (v G.! 0) :+ (v G.! 1)
 
-instance Splat t a => Splat t (V1 a) where
-    splen t _ = splen t (Proxy :: Proxy a)
+instance Splat t (V1 t) where
+    splen t _ = splen t (Proxy :: Proxy t)
     splat (V1 a) = splat a
     unsplat = V1 . unsplat
 
-instance Splat t a => Splat t (V2 a) where
-    splen t _ = splen t (Proxy :: Proxy (a,a))
+instance Splat t (V2 t) where
+    splen t _ = splen t (Proxy :: Proxy (t,t))
     splat (V2 a b) = splat (a,b)
     unsplat v = let (a,b) = unsplat v in V2 a b
 
-instance Splat t a => Splat t (V3 a) where
-    splen t _ = splen t (Proxy :: Proxy (a,a,a))
+instance Splat t (V3 t) where
+    splen t _ = splen t (Proxy :: Proxy (t,t,t))
     splat (V3 a b c) = splat (a,b,c)
     unsplat v = let (a,b,c) = unsplat v in V3 a b c
 
-instance Splat t a => Splat t (V4 a) where
-    splen t _ = splen t (Proxy :: Proxy (a,a,a,a))
+instance Splat t (V4 t) where
+    splen t _ = splen t (Proxy :: Proxy (t,t,t,t))
     splat (V4 a b c d) = splat (a,b,c,d)
     unsplat v = let (a,b,c,d) = unsplat v in V4 a b c d
 
@@ -187,6 +178,12 @@ timeFn = timeFn' 0
 become :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
 become = SSwitch
 
+-- | Memoize the result of evaluating this Signal so that repeated
+-- uses don't have to re-evaluate everything. Integrations are
+-- already shared by default, so avoid sharing them directly.
+share :: Signal t a -> Signal t a
+share = SShare
+
 root :: (Ord t, Num t) => Signal t t -> Event t ()
 root = ERoot
 
@@ -215,11 +212,12 @@ type instance NetStoreVec Double = UV.Vector
 type instance NetStoreVec Float = UV.Vector
 type instance NetStoreVec Word = UV.Vector
 type instance NetStoreVec Int = UV.Vector
+type instance NetStoreVec (Fixed a) = V.Vector
 
 type NetStore t = NetStoreVec t t
 type NetStoreMut t = G.Mutable (NetStoreVec t) t
 
-type Time t = (G.Vector (NetStoreVec t) t)
+type Time t = (G.Vector (NetStoreVec t) t, Show (NetStore t))
 
 data Network t o = Network
     { netIntState :: NetStore t
@@ -248,6 +246,7 @@ gc n@Network{..} =
         go (SPure _) = return ()
         go (SFn ix _) = modify $ mappend (mempty, Set.singleton ix)
         go (SSwitch s e) = go s >> goE e
+        go (SShare s) = go s
 
         goE :: Event t a -> State (IntSet, IntSet) ()
         goE (ERoot s) = go s
@@ -266,6 +265,7 @@ gc n@Network{..} =
         rename m (SInt ix) = SInt (m Map.! ix)
         rename m s@SFn{} = s
         rename m (SSwitch s e) = SSwitch (rename m s) (renameE m e)
+        rename m (SShare s) = SShare (rename m s)
 
         renameE :: IntMap Int -> Event t a -> Event t a
         renameE m (ERoot s) = ERoot (rename m s)
@@ -303,7 +303,7 @@ eventOccured old new (ERoot s)
 runSwitches' :: forall v t o. Time t => Network t o -> Network t o -> (Bool, Network t o)
 runSwitches' old new =
     let
-        go :: Signal t a -> WriterT Monoid.Any (Sim t) (Signal t a)
+        go :: Signal t a -> WriterT Any (Sim t) (Signal t a)
         go s@(SPure a) = return s
         go (SMap f s) = go s >>= pure . SMap f
         go (SAp f a) = do
@@ -313,13 +313,14 @@ runSwitches' old new =
         go s@(SInt ix) = return s
         go s@(SFn ix f) = return s
         go (SSwitch s e) = case eventOccured old new e of
-            Just v -> tell (Monoid.Any True) >> lift v
+            Just v -> tell (Any True) >> lift v
             Nothing -> do
                 s' <- go s
                 e' <- goE e
                 return $ SSwitch s' e'
+        go (SShare s) = go s >>= pure . SShare
 
-        goE :: Event t a -> WriterT Monoid.Any (Sim t) (Event t a)
+        goE :: Event t a -> WriterT Any (Sim t) (Event t a)
         goE (ERoot s) = go s >>= pure . ERoot
         goE (EMap f e) = goE e >>= pure . EMap f
         goE (ETag e s) = do
@@ -327,13 +328,13 @@ runSwitches' old new =
             s' <- go s
             return (ETag e' s')
         
-        ((root', changed), net') = addSim new $ runWriterT (go $ netRoot new) 
+        ((root', Any changed), net') = addSim new $ runWriterT (go $ netRoot new) 
     in 
-        if getAny changed
-        then (getAny changed, gc $ net'
+        if changed
+        then (changed, gc $ net'
             { netRoot = root'
             })
-        else (getAny changed, new)
+        else (changed, new)
         
 runSwitches old new = snd $ runSwitches' old new
 anyEvent old new = fst $ runSwitches' old new
@@ -360,14 +361,52 @@ addSim :: Time t => Network t o -> Sim t a -> (a, Network t o)
 addSim n (Sim s) = runState s n
 
 
+evalSignal'
+    :: forall t o a. (Time t)
+    => Network t o -> Signal t a -> State (IntMap (StableName Prim.Any, Any)) a
+evalSignal' c me@(SShare s) = do
+    m <- get
+    let
+        name = unsafePerformIO $ makeStableName me
+        nameh = hashStableName name
+        mv = do
+            (n,v) <- Map.lookup nameh m
+            if eqStableName name n
+            then return $ unsafeCoerce v
+            else Nothing
+    case mv of
+        Just v -> return v
+        Nothing -> do
+            v' <- evalSignal' c s
+            put $ Map.insert nameh (unsafeCoerce name, unsafeCoerce v') m
+            return v'
+evalSignal' c (SPure a) = return a
+evalSignal' c (SMap f s) = f <$> evalSignal' c s
+evalSignal' c (SAp f a) = do
+    f' <- evalSignal' c f
+    a' <- evalSignal' c a
+    return $ f' a'
+evalSignal' c (SFn ix f) = return $ f $ netFnTime c G.! ix
+evalSignal' c (SInt ix) = do
+    let
+        len = splen (Proxy :: Proxy t) (Proxy :: Proxy a)
+    return $ unsplat $ G.slice ix len (netIntState c)
+evalSignal' c (SSwitch s _) = evalSignal' c s
+
+evalSignal'' :: forall t o a. Time t => Network t o -> Signal t a -> a
+evalSignal'' c (SPure a) = a
+evalSignal'' c (SMap f s) = f $ evalSignal c s
+evalSignal'' c (SAp f a) = evalSignal c f $ evalSignal c a
+evalSignal'' c (SFn ix f) = f $ netFnTime c G.! ix
+evalSignal'' c (SInt ix) = unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy :: Proxy a)) (netIntState c)
+evalSignal'' c (SSwitch s _) = evalSignal c s
+evalSignal'' c (SShare s) = evalSignal c s
 
 evalSignal :: forall t o a. Time t => Network t o -> Signal t a -> a
-evalSignal c (SPure a) = a
-evalSignal c (SMap f s) = f $ evalSignal c s
-evalSignal c (SAp f a) = evalSignal c f $ evalSignal c a
-evalSignal c (SFn ix f) = f $ netFnTime c G.! ix
-evalSignal c (SInt ix) = unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy :: Proxy a)) (netIntState c)
-evalSignal c (SSwitch s _) = evalSignal c s
+evalSignal n s = evalState (evalSignal' n s) mempty
+--evalSignal = evalSignal''
+--evalSignal n = memo (evalSignal'' n)
+--{-# NOINLINE evalSignal #-}
 
 evalRoot :: Time t => Network t o -> o
 evalRoot c = evalSignal c (netRoot c)
@@ -381,7 +420,6 @@ deltaNetTime :: (Num t, Time t) => Network t o -> t -> Network t o
 deltaNetTime n@Network{..} h = n
     { netFnTime  = G.map (+h) netFnTime
     }
-
 
 derivs :: (Num t, Time t) => Network t o -> t -> NetStore t -> NetStore t
 derivs n h dv =
@@ -502,12 +540,15 @@ becomeNothingOn s e = becomeOn (fmap Just s) e $ \_ -> return $ pure Nothing
 
 --------------------------------
 
-example :: (Time t, Fractional t) => Sim t (Signal t (t, t))
-example = do
+-- Ex1 demonstrates basic integration with recursion.
+ex1 :: (Time t, Fractional t) => Sim t (Signal t (t, t))
+ex1 = do
     rec a <- integral 0.5 a
     b <- integral 0 1
     return $ (,) <$> a <*> b
 
+-- Ex2 shows how to use `become` to change a singal to a new one upon
+-- an event.
 ex2 :: forall t. (Fractional t, Ord t, Time t) => Sim t (Signal t t)
 ex2 = do
     t <- integral 5 (-1)
@@ -516,6 +557,7 @@ ex2 = do
         e' = fmap (const $ pure 3) e
     return $ become 1 e'
 
+-- Ex3 show the use of `switch` to control a signal.
 ex3 :: (Time t, Floating t, Ord t) => Sim t (Signal t (t,t))
 ex3 = do
     t <- timeFn sin
@@ -524,17 +566,31 @@ ex3 = do
         e' = fmap (\(_,v) -> return $ pure v) e
     return $ (,) <$> t <*> switch 0 e'
 
+
+-- Ex4 can be used to demonstrate the accuracy of various integrators.
 ex4 :: (Floating t, Time t) => Sim t (Signal t (t,t))
 ex4 = do
     s <- timeFn sin
     s' <- integral (-1) s >>= integral 0 >>= integral 1 >>= integral 0
     return $ (,) <$> s <*> s'
 
-ex5 :: (Floating t, Time t, Ord t) => Sim t (Signal t (Maybe (t)))
+-- Ex5 demonstrates using `Maybe` to terminate a simulation with
+-- `simulateJust`.
+ex5 :: (Floating t, Time t, Ord t) => Sim t (Signal t (Maybe (V4 t)))
 ex5 = do
-    i <- integral 0 $ pure (V4 0 1 2 (-0.5)) 
+    i <- (integral 0 $ pure (V4 0 1 2 (-0.5)) )
     let
         s = fmap (\i -> 5 - norm i) i
         e = root s
-    return $ s `becomeNothingOn` e
-        
+    return $ i `becomeNothingOn` e
+
+-- Ex6 demonstrates the use of `share` to reduce the number
+-- of times a signal is evaluated. The trace will show
+-- "Calc A" once, but "Calc B" twice.
+ex6 :: (Time t, Floating t) => Sim t (Signal t (V4 t))
+ex6 = do
+    let
+        a = share $ fmap (trace "Calc A") $ 5 + 2
+        b = fmap (trace "Calc B") $ 5 + 2
+    return $ V4 <$> a <*> a <*> b <*> b
+
