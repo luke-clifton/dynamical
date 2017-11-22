@@ -45,6 +45,12 @@ import System.IO.Unsafe (unsafePerformIO)
 import System.Mem.StableName (hashStableName,eqStableName,StableName,makeStableName)
 import Unsafe.Coerce (unsafeCoerce)
 
+-------------------------------------------------------------------
+-- Signal
+-------------------------------------------------------------------
+
+-- | A `Signal t a` represents a time varying value of type `a`, where
+-- time is measured using a `t`.
 data Signal t a where
     SPure   :: a -> Signal t a
     SAp     :: Signal t (a -> b) -> Signal t a -> Signal t b
@@ -69,13 +75,9 @@ instance Num a => Num (Signal t a) where
     signum a = signum <$> a
     negate a = negate <$> a
 
-instance Show (Signal t a) where
-    show (SInt i) = "SInt " ++ show i
-    show (SFn  i _) = "SFn " ++ show i
-    show (SMap f s) = "SMap (" ++ show s ++ ")"
-    show (SAp f a) = "SAp (" ++ show f ++ ") (" ++ show a ++ ")"
-    show (SSwitch s e) = "SSwitch (" ++ show s ++ ")"
-    show (SPure _) = "SPure"
+-------------------------------------------------------------------
+-- Event
+-------------------------------------------------------------------
 
 data Event t a where
     ERoot  :: (Num a, Ord a) => Signal t a -> Event t ()
@@ -90,103 +92,11 @@ evalEvent n (ETag e s) = (evalEvent n e, evalSignal n s)
 instance Functor (Event t) where
     fmap = EMap
 
+-------------------------------------------------------------------
+-- Sim
+-------------------------------------------------------------------
+
 newtype Sim t a = Sim {unSim :: forall o. State (Network t o) a}
-
-class Splat t a where
-    splen :: Proxy t -> Proxy a -> Int
-    splat :: Time t => a -> NetStore t
-    unsplat :: Time t => NetStore t -> a
-
-instance Splat t t where
-    splen _ _ = 1
-    splat t = G.singleton t
-    unsplat v = v G.! 0
-
-instance Splat t (t,t) where
-    splen t _ = 2
-    splat (a,b) = splat a G.++ splat b
-    unsplat v = (v G.! 0, v G.! 1)
-
-instance Splat t (t,t,t) where
-    splen t _ = 3
-    splat (a,b,c) = G.fromList [a,b,c]
-    unsplat v = (v G.! 0, v G.! 1, v G.! 2)
-
-instance Splat t (t,t,t,t) where
-    splen t _ = 4
-    splat (a,b,c,d) = G.fromList [a,b,c,d]
-    unsplat v = (v G.! 0, v G.! 1, v G.! 2, v G.! 3)
-
-instance Splat t (Complex t) where
-    splen t _ = 2
-    splat (a :+ b) = G.fromList [a,b]
-    unsplat v = (v G.! 0) :+ (v G.! 1)
-
-instance Splat t (V1 t) where
-    splen t _ = splen t (Proxy :: Proxy t)
-    splat (V1 a) = splat a
-    unsplat = V1 . unsplat
-
-instance Splat t (V2 t) where
-    splen t _ = splen t (Proxy :: Proxy (t,t))
-    splat (V2 a b) = splat (a,b)
-    unsplat v = let (a,b) = unsplat v in V2 a b
-
-instance Splat t (V3 t) where
-    splen t _ = splen t (Proxy :: Proxy (t,t,t))
-    splat (V3 a b c) = splat (a,b,c)
-    unsplat v = let (a,b,c) = unsplat v in V3 a b c
-
-instance Splat t (V4 t) where
-    splen t _ = splen t (Proxy :: Proxy (t,t,t,t))
-    splat (V4 a b c d) = splat (a,b,c,d)
-    unsplat v = let (a,b,c,d) = unsplat v in V4 a b c d
-
-integral :: (Splat t a, Time t) => a -> Signal t a -> Sim t (Signal t a)
-integral i s = Sim $ do
-    st <- get
-    let
-        sp = splat i
-        ix = G.length (netIntState st)
-    put st
-        { netIntState = netIntState st G.++ sp
-        , netIntDeriv = Map.insert ix (fmap splat s) (netIntDeriv st)
-        }
-    return $ SInt ix
-
-timeFn' :: Time t => t -> (t -> a) -> Sim t (Signal t a)
-timeFn' t f = Sim $ do
-    st <- get
-    let
-        ix = G.length (netFnTime st)
-    put st
-        { netFnTime = netFnTime st `G.snoc` t
-        }
-    return $ SFn ix f
-
-switch :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
-switch s e = become s (fmap (\s' -> s' >>= \s'' -> pure (switch s'' e)) e)
-
-becomeOn :: Signal t a -> Event t b -> (b -> Sim t (Signal t a)) -> Signal t a
-becomeOn s e f = become s (fmap f e)
-
-timeFn :: (Time t, Num t) => (t -> a) -> Sim t (Signal t a)
-timeFn = timeFn' 0
-
-become :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
-become = SSwitch
-
--- | Memoize the result of evaluating this Signal so that repeated
--- uses don't have to re-evaluate everything. Integrations are
--- already shared by default, so avoid sharing them directly.
-share :: Signal t a -> Signal t a
-share = SShare
-
-root :: (Ord t, Num t) => Signal t t -> Event t ()
-root = ERoot
-
-tag :: Event t a -> Signal t b -> Event t (a,b)
-tag  = ETag
 
 instance Functor (Sim t) where
     fmap f (Sim s) = Sim (fmap f s)
@@ -204,6 +114,9 @@ instance Monad (Sim t) where
 instance MonadFix (Sim t) where
     mfix f = Sim $ mfix (unSim . f)
 
+-------------------------------------------------------------------
+-- Network
+-------------------------------------------------------------------
 
 type family NetStoreVec a :: * -> *
 type instance NetStoreVec Double = UV.Vector
@@ -337,10 +250,6 @@ runSwitches' old new =
 runSwitches old new = snd $ runSwitches' old new
 anyEvent old new = fst $ runSwitches' old new
 
-newtype Integrator t o = Integrator
-    { runIntegrator :: Network t o -> (Network t o, t, Integrator t o)
-    }
-
 newDoubleSim :: Sim Double (Signal Double a) -> Network Double a
 newDoubleSim = newSim
 
@@ -357,7 +266,6 @@ newSim (Sim s) =
 
 addSim :: Time t => Network t o -> Sim t a -> (a, Network t o)
 addSim n (Sim s) = runState s n
-
 
 -- TODO: Below are three implementations of evalSignal. Each with different
 -- sharing characteristics.
@@ -453,6 +361,122 @@ derivs n h dv =
 derivsNow :: (Time t) => Network t o -> NetStore t
 derivsNow n = G.concat $ map (evalSignal n . snd) $ Map.toAscList $ netIntDeriv n
 
+
+-------------------------------------------------------------------
+-- Splat
+-------------------------------------------------------------------
+
+class Splat t a where
+    splen :: Proxy t -> Proxy a -> Int
+    splat :: Time t => a -> NetStore t
+    unsplat :: Time t => NetStore t -> a
+
+instance Splat t t where
+    splen _ _ = 1
+    splat t = G.singleton t
+    unsplat v = v G.! 0
+
+instance Splat t (t,t) where
+    splen t _ = 2
+    splat (a,b) = splat a G.++ splat b
+    unsplat v = (v G.! 0, v G.! 1)
+
+instance Splat t (t,t,t) where
+    splen t _ = 3
+    splat (a,b,c) = G.fromList [a,b,c]
+    unsplat v = (v G.! 0, v G.! 1, v G.! 2)
+
+instance Splat t (t,t,t,t) where
+    splen t _ = 4
+    splat (a,b,c,d) = G.fromList [a,b,c,d]
+    unsplat v = (v G.! 0, v G.! 1, v G.! 2, v G.! 3)
+
+instance Splat t (Complex t) where
+    splen t _ = 2
+    splat (a :+ b) = G.fromList [a,b]
+    unsplat v = (v G.! 0) :+ (v G.! 1)
+
+instance Splat t (V1 t) where
+    splen t _ = splen t (Proxy :: Proxy t)
+    splat (V1 a) = splat a
+    unsplat = V1 . unsplat
+
+instance Splat t (V2 t) where
+    splen t _ = splen t (Proxy :: Proxy (t,t))
+    splat (V2 a b) = splat (a,b)
+    unsplat v = let (a,b) = unsplat v in V2 a b
+
+instance Splat t (V3 t) where
+    splen t _ = splen t (Proxy :: Proxy (t,t,t))
+    splat (V3 a b c) = splat (a,b,c)
+    unsplat v = let (a,b,c) = unsplat v in V3 a b c
+
+instance Splat t (V4 t) where
+    splen t _ = splen t (Proxy :: Proxy (t,t,t,t))
+    splat (V4 a b c d) = splat (a,b,c,d)
+    unsplat v = let (a,b,c,d) = unsplat v in V4 a b c d
+
+-------------------------------------------------------------------
+-- API
+-------------------------------------------------------------------
+
+integral :: (Splat t a, Time t) => a -> Signal t a -> Sim t (Signal t a)
+integral i s = Sim $ do
+    st <- get
+    let
+        sp = splat i
+        ix = G.length (netIntState st)
+    put st
+        { netIntState = netIntState st G.++ sp
+        , netIntDeriv = Map.insert ix (fmap splat s) (netIntDeriv st)
+        }
+    return $ SInt ix
+
+timeFn' :: Time t => t -> (t -> a) -> Sim t (Signal t a)
+timeFn' t f = Sim $ do
+    st <- get
+    let
+        ix = G.length (netFnTime st)
+    put st
+        { netFnTime = netFnTime st `G.snoc` t
+        }
+    return $ SFn ix f
+
+switch :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
+switch s e = become s (fmap (\s' -> s' >>= \s'' -> pure (switch s'' e)) e)
+
+becomeOn :: Signal t a -> Event t b -> (b -> Sim t (Signal t a)) -> Signal t a
+becomeOn s e f = become s (fmap f e)
+
+timeFn :: (Time t, Num t) => (t -> a) -> Sim t (Signal t a)
+timeFn = timeFn' 0
+
+become :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
+become = SSwitch
+
+-- | Memoize the result of evaluating this Signal so that repeated
+-- uses don't have to re-evaluate everything. Integrations are
+-- already shared by default, so avoid sharing them directly.
+share :: Signal t a -> Signal t a
+share = SShare
+
+root :: (Ord t, Num t) => Signal t t -> Event t ()
+root = ERoot
+
+tag :: Event t a -> Signal t b -> Event t (a,b)
+tag  = ETag
+
+
+replace :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
+replace = SSwitch
+
+becomeNothingOn :: Signal t a -> Event t b -> Signal t (Maybe a)
+becomeNothingOn s e = becomeOn (fmap Just s) e $ \_ -> return $ pure Nothing
+
+-------------------------------------------------------------------
+-- Simulation
+-------------------------------------------------------------------
+
 simulateDouble
     :: Integrator Double o
     -> Sim Double (Signal Double o)
@@ -476,10 +500,47 @@ simulate integrator s =
                  )
         ) (integrator,n,0)
 
-replace :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
-replace = SSwitch
+runRk4RealTime :: forall a. Show a => Sim Double (Signal Double a) -> IO ()
+runRk4RealTime s =
+    let
+        n = newSim s
+        go :: UTCTime -> Network Double a -> IO ()
+        go prev n = do
+            now <- getCurrentTime
+            let
+                h = realToFrac $ diffUTCTime now prev
+                (n',_,_) = runIntegrator (rk4 h) n
+            print $ evalRoot n'
+            go now n'
+    in do
+        now <- getCurrentTime
+        go now n
 
---------------------------------
+runRk4RealTimeJust :: forall a. Show a => Sim Double (Signal Double (Maybe a)) -> IO ()
+runRk4RealTimeJust s =
+    let
+        n = newSim s
+        go :: UTCTime -> Network Double (Maybe a) -> IO ()
+        go prev n = do
+            now <- getCurrentTime
+            let
+                h = realToFrac $ diffUTCTime now prev
+                (n',_,_) = runIntegrator (rk4 h) n
+            case evalRoot n' of
+                Nothing -> return ()
+                Just x -> print x >> go now n'
+    in do
+        now <- getCurrentTime
+        go now n
+
+
+-------------------------------------------------------------------
+-- Integrators
+-------------------------------------------------------------------
+
+newtype Integrator t o = Integrator
+    { runIntegrator :: Network t o -> (Network t o, t, Integrator t o)
+    }
 
 euler :: (Num t, Time t) => t -> Integrator t o
 euler h = integrator
@@ -525,43 +586,10 @@ rk4 h = integrator
             in
                 (runSwitches n n', h, integrator)
 
-runRk4RealTime :: forall a. Show a => Sim Double (Signal Double a) -> IO ()
-runRk4RealTime s =
-    let
-        n = newSim s
-        go :: UTCTime -> Network Double a -> IO ()
-        go prev n = do
-            now <- getCurrentTime
-            let
-                h = realToFrac $ diffUTCTime now prev
-                (n',_,_) = runIntegrator (rk4 h) n
-            print $ evalRoot n'
-            go now n'
-    in do
-        now <- getCurrentTime
-        go now n
 
-runRk4RealTimeJust :: forall a. Show a => Sim Double (Signal Double (Maybe a)) -> IO ()
-runRk4RealTimeJust s =
-    let
-        n = newSim s
-        go :: UTCTime -> Network Double (Maybe a) -> IO ()
-        go prev n = do
-            now <- getCurrentTime
-            let
-                h = realToFrac $ diffUTCTime now prev
-                (n',_,_) = runIntegrator (rk4 h) n
-            case evalRoot n' of
-                Nothing -> return ()
-                Just x -> print x >> go now n'
-    in do
-        now <- getCurrentTime
-        go now n
-
-becomeNothingOn :: Signal t a -> Event t b -> Signal t (Maybe a)
-becomeNothingOn s e = becomeOn (fmap Just s) e $ \_ -> return $ pure Nothing
-
---------------------------------
+-------------------------------------------------------------------
+-- Examples/Test
+-------------------------------------------------------------------
 
 -- Ex1 demonstrates basic integration with recursion.
 ex1 :: (Time t, Fractional t) => Sim t (Signal t (t, t))
