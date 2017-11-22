@@ -1,4 +1,5 @@
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE IncoherentInstances #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -14,6 +15,7 @@
 
 module Dynamical.Sim.Internal where
 
+import Data.Complex
 import Data.Proxy
 import Data.Maybe
 import Data.Fixed
@@ -33,9 +35,13 @@ import Graphics.Rendering.Chart.Backend.Diagrams
 import qualified Data.IntSet as Set
 import Data.IntSet (IntSet)
 import qualified Data.Vector.Unboxed as UV
+import qualified Data.Vector.Unboxed.Mutable as UM
 import qualified Data.Vector.Generic as G
+import qualified Data.Vector.Generic.Mutable as GM
 import qualified Data.Vector as V
+import qualified Data.Vector.Mutable as VM
 import Data.Time
+import Linear
 
 -- TODO: Think about sharing.
 
@@ -85,39 +91,7 @@ instance Functor (Event t) where
 
 newtype Sim t a = Sim {unSim :: forall o. State (Network t o) a}
 
-class Integrable t a where
-    integrate :: a -> Signal t a -> Sim t (Signal t a)
-
-instance (Integrable t a, Integrable t b) => Integrable t (a,b) where
-    integrate (a,b) s = do
-        a' <- integrate a (fmap fst s)
-        b' <- integrate b (fmap snd s)
-        return $ (,) <$> a' <*> b'
-
-instance (Integrable t a, Integrable t b, Integrable t c) => Integrable t (a,b,c) where
-    integrate (a,b,c) s = do
-        a' <- integrate a (fmap (\(a,_,_) -> a) s)
-        b' <- integrate b (fmap (\(_,b,_) -> b) s)
-        c' <- integrate c (fmap (\(_,_,c) -> c) s)
-        return $ (,,) <$> a' <*> b' <*> c'
-
-instance Time t => Integrable t t where
-    integrate a s = integral a s
-
-{-
-integral :: Time t => t -> Signal t t -> Sim t (Signal t t)
-integral i s = Sim $ do
-    st <- get
-    let
-        ix = G.length (netIntState st)
-    put st
-        { netIntState = netIntState st `G.snoc` i
-        , netIntDeriv = netIntDeriv st `G.snoc` (fmap splat s)
-        }
-    return $ SInt ix
--}
-
-class Splat t a where
+class Splat t a | a -> t where
     splen :: Proxy t -> Proxy a -> Int
     splat :: Time t => a -> NetStore t
     unsplat :: Time t => NetStore t -> a
@@ -127,10 +101,59 @@ instance Splat t t where
     splat t = G.singleton t
     unsplat v = v G.! 0
 
-instance Time t => Splat t (t,t) where
-    splen _ _ = 2
-    splat (a,b) = G.fromList [a,b]
-    unsplat v = (v G.! 0, v G.! 1)
+instance (Splat t a, Splat t b) => Splat t (a,b) where
+    splen t _ = splen t (Proxy :: Proxy t) + splen t (Proxy :: Proxy b)
+    splat (a,b) = splat a G.++ splat b
+    unsplat v =
+        let
+            (a,b) = G.splitAt (splen (Proxy :: Proxy t) (Proxy :: Proxy t)) v
+        in (unsplat a, unsplat b)
+
+instance (Splat t a, Splat t b, Splat t c) => Splat t (a,b,c) where
+    splen t _ = splen t (Proxy :: Proxy a) + splen t (Proxy :: Proxy (b,c))
+    splat (a,b,c) = splat a G.++ splat (b,c)
+    unsplat v =
+        let
+            (a,x) = G.splitAt (splen (Proxy :: Proxy t) (Proxy :: Proxy t)) v
+            (b,c) = unsplat x
+        in (unsplat a, b, c)
+
+instance (Splat t a, Splat t b, Splat t c, Splat t d) => Splat t (a,b,c,d) where
+    splen t _ = splen t (Proxy :: Proxy a) + splen t (Proxy :: Proxy (b,c,d))
+    splat (a,b,c,d) = splat a G.++ splat (b,c,d)
+    unsplat v =
+        let
+            (a,x) = G.splitAt (splen (Proxy :: Proxy t) (Proxy :: Proxy t)) v
+            (b,c,d) = unsplat x
+        in (unsplat a, b, c, d)
+
+instance Splat t a => Splat t (Complex a) where
+    splen t _ = splen t (Proxy :: Proxy a) + splen t (Proxy :: Proxy a)
+    splat (a :+ b) = splat a G.++ splat b
+    unsplat v =
+        let
+            (a,b) = G.splitAt (splen (Proxy :: Proxy t) (Proxy :: Proxy a)) v
+        in unsplat a :+ unsplat b
+
+instance Splat t a => Splat t (V1 a) where
+    splen t _ = splen t (Proxy :: Proxy a)
+    splat (V1 a) = splat a
+    unsplat = V1 . unsplat
+
+instance Splat t a => Splat t (V2 a) where
+    splen t _ = splen t (Proxy :: Proxy (a,a))
+    splat (V2 a b) = splat (a,b)
+    unsplat v = let (a,b) = unsplat v in V2 a b
+
+instance Splat t a => Splat t (V3 a) where
+    splen t _ = splen t (Proxy :: Proxy (a,a,a))
+    splat (V3 a b c) = splat (a,b,c)
+    unsplat v = let (a,b,c) = unsplat v in V3 a b c
+
+instance Splat t a => Splat t (V4 a) where
+    splen t _ = splen t (Proxy :: Proxy (a,a,a,a))
+    splat (V4 a b c d) = splat (a,b,c,d)
+    unsplat v = let (a,b,c,d) = unsplat v in V4 a b c d
 
 integral :: (Splat t a, Time t) => a -> Signal t a -> Sim t (Signal t a)
 integral i s = Sim $ do
@@ -167,7 +190,7 @@ timeFn = timeFn' 0
 become :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
 become = SSwitch
 
-root :: (Ord a, Num a) => Signal t a -> Event t ()
+root :: (Ord t, Num t) => Signal t t -> Event t ()
 root = ERoot
 
 tag :: Event t a -> Signal t b -> Event t (a,b)
@@ -201,15 +224,16 @@ fnApply FnS{..} = fnFunc fnLocalTime
 instance Show t => Show (FnS t) where
     show FnS{..} = "FnS " ++ show fnLocalTime
 
-type family NetStore' a :: * -> *
-type instance NetStore' Double = UV.Vector
-type instance NetStore' Float = UV.Vector
-type instance NetStore' Word = UV.Vector
-type instance NetStore' Int = UV.Vector
+type family NetStoreVec a :: * -> *
+type instance NetStoreVec Double = UV.Vector
+type instance NetStoreVec Float = UV.Vector
+type instance NetStoreVec Word = UV.Vector
+type instance NetStoreVec Int = UV.Vector
 
-type NetStore t = NetStore' t t
+type NetStore t = NetStoreVec t t
+type NetStoreMut t = G.Mutable (NetStoreVec t) t
 
-type Time t = (G.Vector (NetStore' t) t)
+type Time t = (G.Vector (NetStoreVec t) t)
 
 data Network t o = Network
     { netIntState :: NetStore t
@@ -263,7 +287,6 @@ gc n@Network{..} =
         intCnt = UV.length intMap
 
         intState' = G.generate intCnt $ \ix -> netIntState G.! (intMap UV.! ix)
-        -- intDeriv' = G.generate intCnt $ \ix -> netIntDeriv Map.! (intMap UV.! ix)
 
         restrictKeys m s = Map.filterWithKey (\k _ -> k `Set.member` s) m
         intDeriv' = restrictKeys netIntDeriv intReachable
@@ -318,10 +341,10 @@ runSwitches' old new =
         ((root', changed), net') = addSim new $ runWriterT (go $ netRoot new) 
     in 
         if getAny changed
-        then (getAny changed, gc $ net'
+        then (getAny changed, Debug.Trace.trace "switched" $ gc $ net'
             { netRoot = root'
             })
-        else (getAny changed, new)
+        else (getAny changed, Debug.Trace.trace "new" new)
         
 runSwitches old new = snd $ runSwitches' old new
 anyEvent old new = fst $ runSwitches' old new
@@ -375,7 +398,7 @@ derivs :: (Num t, Time t) => Network t o -> t -> NetStore t -> NetStore t
 derivs n h dv =
     let
         n' = deltaNet n h dv
-    in G.concat $ map (evalSignal n' . snd) $ Map.toAscList $ netIntDeriv n'
+    in derivsNow n'
 
 derivsNow :: (Time t) => Network t o -> NetStore t
 derivsNow n = G.concat $ map (evalSignal n . snd) $ Map.toAscList $ netIntDeriv n
@@ -385,6 +408,9 @@ simulateDouble
     -> Sim Double (Signal Double o)
     -> [(Double,Network Double o)]
 simulateDouble = simulate
+
+simulateJust :: (Num t, Time t) => Integrator t (Maybe o) -> Sim t (Signal t (Maybe o)) -> [(t,o)]
+simulateJust i s = fmap (\(t,Just x) -> (t,x)) $ takeWhile (isJust . snd) $ fmap evalRoot <$> simulate i s
 
 simulate :: forall v t o. (Num t, Time t) => Integrator t o -> Sim t (Signal t o) -> [(t,Network t o)]
 simulate integrator s =
@@ -402,7 +428,6 @@ simulate integrator s =
 
 replace :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
 replace = SSwitch
-
 
 --------------------------------
 
@@ -466,6 +491,26 @@ runRk4RealTime s =
         now <- getCurrentTime
         go now n
 
+runRk4RealTimeJust :: forall a. Show a => Sim Double (Signal Double (Maybe a)) -> IO ()
+runRk4RealTimeJust s =
+    let
+        n = newSim s
+        go :: UTCTime -> Network Double (Maybe a) -> IO ()
+        go prev n = do
+            now <- getCurrentTime
+            let
+                h = realToFrac $ diffUTCTime now prev
+                (n',_,_) = runIntegrator (rk4 h) n
+            case evalRoot n' of
+                Nothing -> return ()
+                Just x -> print x >> go now n'
+    in do
+        now <- getCurrentTime
+        go now n
+
+becomeNothingOn :: Signal t a -> Event t b -> Signal t (Maybe a)
+becomeNothingOn s e = becomeOn (fmap Just s) e $ \_ -> return $ pure Nothing
+
 --------------------------------
 
 example :: (Time t, Fractional t) => Sim t (Signal t (t, t))
@@ -476,7 +521,7 @@ example = do
 
 ex2 :: forall t. (Fractional t, Ord t, Time t) => Sim t (Signal t t)
 ex2 = do
-    t <- integral (5 :: t) (-1)
+    t <- integral 5 (-1)
     let
         e = root t
         e' = fmap (const $ pure 3) e
@@ -496,3 +541,11 @@ ex4 = do
     s' <- integral (-1) s >>= integral 0 >>= integral 1 >>= integral 0
     return $ (,) <$> s <*> s'
 
+ex5 :: (Floating t, Time t, Ord t) => Sim t (Signal t (Maybe (t)))
+ex5 = do
+    i <- integral 0 $ pure (V4 0 1 2 (-0.5)) 
+    let
+        s = fmap (\i -> 5 - norm i) i
+        e = root s
+    return $ s `becomeNothingOn` e
+        
