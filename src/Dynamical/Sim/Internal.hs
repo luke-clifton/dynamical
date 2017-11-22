@@ -14,9 +14,6 @@
 
 module Dynamical.Sim.Internal where
 
-import qualified GHC.Prim as Prim
-import Data.StableMemo
-import Unsafe.Coerce (unsafeCoerce)
 import Control.Applicative
 import Control.Monad
 import Control.Monad.Fix (MonadFix(mfix))
@@ -33,6 +30,7 @@ import Data.List
 import Data.Maybe
 import Data.Monoid (Monoid(), Any(Any), (<>), mempty, mappend)
 import Data.Proxy (Proxy(Proxy))
+import Data.StableMemo (memo)
 import Data.Time (getCurrentTime, diffUTCTime, UTCTime)
 import qualified Data.Vector as V
 import qualified Data.Vector.Generic as G
@@ -41,9 +39,11 @@ import qualified Data.Vector.Mutable as VM
 import qualified Data.Vector.Unboxed as UV
 import qualified Data.Vector.Unboxed.Mutable as UM
 import Debug.Trace
+import qualified GHC.Prim as Prim
 import Linear (V1(..), V2(..), V3(..), V4(..), norm)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Mem.StableName (hashStableName,eqStableName,StableName,makeStableName)
+import Unsafe.Coerce (unsafeCoerce)
 
 -- TODO: Think about sharing.
 
