@@ -402,9 +402,25 @@ evalSignal'' c (SInt ix) = unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy
 evalSignal'' c (SSwitch s _) = evalSignal c s
 evalSignal'' c (SShare s) = evalSignal c s
 
+evalSignal''' :: forall t o a. Time t => Network t o -> Signal t a -> a
+evalSignal''' c = go
+    where
+        go :: Signal t c -> c
+        go = memo gogo
+
+        gogo :: forall b. Signal t b -> b
+        gogo (SPure a) = a
+        gogo (SMap f s) = f $ go s
+        gogo (SAp f a) = go f $ go a
+        gogo (SFn ix f) = f $ netFnTime c G.! ix
+        gogo (SInt ix) = unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy :: Proxy b)) (netIntState c)
+        gogo (SSwitch s _) = go s
+        gogo (SShare s) = go s
+
 evalSignal :: forall t o a. Time t => Network t o -> Signal t a -> a
-evalSignal n s = evalState (evalSignal' n s) mempty
+--evalSignal n s = evalState (evalSignal' n s) mempty
 --evalSignal = evalSignal''
+evalSignal = evalSignal'''
 --evalSignal n = memo (evalSignal'' n)
 --{-# NOINLINE evalSignal #-}
 
