@@ -24,8 +24,6 @@ import Debug.Trace
 import Control.Monad.State
 import Control.Monad.Writer hiding (Any)
 import Data.List
-import GHC.Prim (Any)
-import Unsafe.Coerce
 import qualified Data.IntMap.Strict as Map
 import Data.IntMap.Strict (IntMap)
 import Data.Monoid hiding (Any)
@@ -50,7 +48,7 @@ data Signal t a where
     SAp     :: Signal t (a -> b) -> Signal t a -> Signal t b
     SMap    :: (a -> b) -> Signal t a -> Signal t b
     SInt    :: Splat t a => Int -> Signal t a
-    SFn     :: Int -> Signal t a
+    SFn     :: Int -> (t -> a) -> Signal t a
     SSwitch :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
 
 instance Functor (Signal t) where
@@ -70,7 +68,7 @@ instance Num a => Num (Signal t a) where
 
 instance Show (Signal t a) where
     show (SInt i) = "SInt " ++ show i
-    show (SFn  i) = "SFn " ++ show i
+    show (SFn  i _) = "SFn " ++ show i
     show (SMap f s) = "SMap (" ++ show s ++ ")"
     show (SAp f a) = "SAp (" ++ show f ++ ") (" ++ show a ++ ")"
     show (SSwitch s e) = "SSwitch (" ++ show s ++ ")"
@@ -167,16 +165,15 @@ integral i s = Sim $ do
         }
     return $ SInt ix
 
-timeFn' :: t -> (t -> a) -> Sim t (Signal t a)
+timeFn' :: Time t => t -> (t -> a) -> Sim t (Signal t a)
 timeFn' t f = Sim $ do
     st <- get
     let
-        mix = Map.maxViewWithKey . netFnS $ st
-        ix = maybe 0 (succ . fst . fst) mix
+        ix = G.length (netFnTime st)
     put st
-        { netFnS = Map.insert ix (FnS t (unsafeCoerce . f)) (netFnS st)
+        { netFnTime = netFnTime st `G.snoc` t
         }
-    return $ SFn ix
+    return $ SFn ix f
 
 switch :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
 switch s e = become s (fmap (\s' -> s' >>= \s'' -> pure (switch s'' e)) e)
@@ -184,7 +181,7 @@ switch s e = become s (fmap (\s' -> s' >>= \s'' -> pure (switch s'' e)) e)
 becomeOn :: Signal t a -> Event t b -> (b -> Sim t (Signal t a)) -> Signal t a
 becomeOn s e f = become s (fmap f e)
 
-timeFn :: Num t => (t -> a) -> Sim t (Signal t a)
+timeFn :: (Time t, Num t) => (t -> a) -> Sim t (Signal t a)
 timeFn = timeFn' 0
 
 become :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
@@ -213,17 +210,6 @@ instance MonadFix (Sim t) where
     mfix f = Sim $ mfix (unSim . f)
 
 
-data FnS t = FnS
-    { fnLocalTime :: !t
-    , fnFunc      :: !(t -> Any)
-    }
-
-fnApply :: FnS t -> Any
-fnApply FnS{..} = fnFunc fnLocalTime
-
-instance Show t => Show (FnS t) where
-    show FnS{..} = "FnS " ++ show fnLocalTime
-
 type family NetStoreVec a :: * -> *
 type instance NetStoreVec Double = UV.Vector
 type instance NetStoreVec Float = UV.Vector
@@ -238,7 +224,7 @@ type Time t = (G.Vector (NetStoreVec t) t)
 data Network t o = Network
     { netIntState :: NetStore t
     , netIntDeriv :: IntMap (Signal t (NetStore t))
-    , netFnS      :: IntMap (FnS t)
+    , netFnTime   :: NetStore t
     , netRoot     :: Signal t o
     }
 
@@ -260,7 +246,7 @@ gc n@Network{..} =
         go (SAp a b) = go a >> go b
         go (SMap _ s) = go s
         go (SPure _) = return ()
-        go (SFn ix) = modify $ mappend (mempty, Set.singleton ix)
+        go (SFn ix _) = modify $ mappend (mempty, Set.singleton ix)
         go (SSwitch s e) = go s >> goE e
 
         goE :: Event t a -> State (IntSet, IntSet) ()
@@ -270,6 +256,8 @@ gc n@Network{..} =
         
         intMap  = UV.fromList (Set.toAscList intReachable)
         intMap' = Map.fromList $ zip (Set.toAscList intReachable) [0..]
+
+        fnMap   = UV.fromList (Set.toAscList fnReachable)
 
         rename :: IntMap Int -> Signal t a -> Signal t a
         rename m (SAp a b) = SAp (rename m a) (rename m b)
@@ -285,18 +273,19 @@ gc n@Network{..} =
         renameE m (ETag e s) = ETag (renameE m e) (rename m s)
 
         intCnt = UV.length intMap
+        fnCnt  = UV.length fnMap
 
         intState' = G.generate intCnt $ \ix -> netIntState G.! (intMap UV.! ix)
 
         restrictKeys m s = Map.filterWithKey (\k _ -> k `Set.member` s) m
         intDeriv' = restrictKeys netIntDeriv intReachable
 
-        fnS' = restrictKeys netFnS fnReachable
+        fnTime' = G.generate fnCnt $ \ix -> netFnTime G.! (fnMap UV.! ix)
 
     in n
         { netIntState = intState'
         , netIntDeriv = fmap (rename intMap') intDeriv'
-        , netFnS = fnS'
+        , netFnTime = fnTime'
         , netRoot = rename intMap' netRoot
         }
 
@@ -322,7 +311,7 @@ runSwitches' old new =
             a' <- go a
             return $ SAp f' a'
         go s@(SInt ix) = return s
-        go s@(SFn ix) = return s
+        go s@(SFn ix f) = return s
         go (SSwitch s e) = case eventOccured old new e of
             Just v -> tell (Monoid.Any True) >> lift v
             Nothing -> do
@@ -341,10 +330,10 @@ runSwitches' old new =
         ((root', changed), net') = addSim new $ runWriterT (go $ netRoot new) 
     in 
         if getAny changed
-        then (getAny changed, Debug.Trace.trace "switched" $ gc $ net'
+        then (getAny changed, gc $ net'
             { netRoot = root'
             })
-        else (getAny changed, Debug.Trace.trace "new" new)
+        else (getAny changed, new)
         
 runSwitches old new = snd $ runSwitches' old new
 anyEvent old new = fst $ runSwitches' old new
@@ -362,7 +351,7 @@ newSim (Sim s) =
         (r,n) = runState s Network
             { netIntState = G.empty
             , netIntDeriv = Map.empty
-            , netFnS  = mempty
+            , netFnTime  = G.empty
             , netRoot = r
             }
     in n
@@ -376,7 +365,7 @@ evalSignal :: forall t o a. Time t => Network t o -> Signal t a -> a
 evalSignal c (SPure a) = a
 evalSignal c (SMap f s) = f $ evalSignal c s
 evalSignal c (SAp f a) = evalSignal c f $ evalSignal c a
-evalSignal c (SFn ix) = unsafeCoerce . fnApply $ netFnS c Map.! ix
+evalSignal c (SFn ix f) = f $ netFnTime c G.! ix
 evalSignal c (SInt ix) = unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy :: Proxy a)) (netIntState c)
 evalSignal c (SSwitch s _) = evalSignal c s
 
@@ -390,7 +379,7 @@ deltaNet n@Network{..} h dv = (deltaNetTime n h)
 
 deltaNetTime :: (Num t, Time t) => Network t o -> t -> Network t o
 deltaNetTime n@Network{..} h = n
-    { netFnS  = Map.map (\s@FnS{..} -> s {fnLocalTime = fnLocalTime + h}) netFnS
+    { netFnTime  = G.map (+h) netFnTime
     }
 
 
@@ -448,7 +437,7 @@ eulerBisect tol h = integrator
         go h' n =
             let
                 ds = derivsNow n
-                n' = deltaNet n h' (G.map (*h) ds)
+                n' = deltaNet n h' (G.map (*h') ds)
                 (e,n'') = runSwitches' n n'
                 res
                     -- TODO: Don't emit nearby points, jump strait to it.
@@ -527,7 +516,7 @@ ex2 = do
         e' = fmap (const $ pure 3) e
     return $ become 1 e'
 
-ex3 :: (Floating t, Ord t) => Sim t (Signal t (t,t))
+ex3 :: (Time t, Floating t, Ord t) => Sim t (Signal t (t,t))
 ex3 = do
     t <- timeFn sin
     let
