@@ -45,8 +45,6 @@ import System.IO.Unsafe (unsafePerformIO)
 import System.Mem.StableName (hashStableName,eqStableName,StableName,makeStableName)
 import Unsafe.Coerce (unsafeCoerce)
 
--- TODO: Think about sharing.
-
 data Signal t a where
     SPure   :: a -> Signal t a
     SAp     :: Signal t (a -> b) -> Signal t a -> Signal t b
@@ -361,6 +359,15 @@ addSim :: Time t => Network t o -> Sim t a -> (a, Network t o)
 addSim n (Sim s) = runState s n
 
 
+-- TODO: Below are three implementations of evalSignal. Each with different
+-- sharing characteristics.
+--  * evalSignal' does explicit sharing
+--  * evalSignal'' does no sharing
+--  * evalSignal''' does implicit sharing
+-- We need to benchmark and determine which is best.
+-- Once we determine which solution to go for, we should integrate it
+-- more with the rest of the code such that sharing caries over to
+-- events.
 evalSignal'
     :: forall t o a. (Time t)
     => Network t o -> Signal t a -> State (IntMap (StableName Prim.Any, Any)) a
