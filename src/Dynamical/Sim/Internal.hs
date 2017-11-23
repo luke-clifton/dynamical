@@ -178,30 +178,36 @@ data Network t o = Network
 gc :: forall v t o. Time t => Network t o -> Network t o
 gc n@Network{..} =
     let
-        (intReachable, fnReachable) = findNames netRoot
+        (intAll, intReachable, fnReachable) = findNames netRoot
 
-        findNames :: Signal t a -> (IntSet, IntSet)
+        findNames :: Signal t a -> (IntSet, IntSet, IntSet)
         findNames s = execState (go s)  mempty
 
-        go :: Signal t a -> State (IntSet,IntSet) ()
+        go :: forall a. Signal t a -> State (IntSet, IntSet, IntSet) ()
         go (SInt ix) = do
-            (i,f) <- get
+            (i,i',f) <- get
             when (not $ Set.member ix i) $ do
-                put (Set.insert ix i, f)
+                let
+                    pt = Proxy :: Proxy t
+                    pa = Proxy :: Proxy a
+                    len = splen pt pa - 1
+                    names = Set.fromList [ix..ix + len]
+                put (i `Set.union` names, Set.insert ix i', f)
                 go (netIntDeriv Map.! ix)
         go (SAp a b) = go a >> go b
         go (SMap _ s) = go s
         go (SPure _) = return ()
-        go (SFn ix _) = modify $ mappend (mempty, Set.singleton ix)
+        go (SFn ix _) = modify $ mappend (mempty, mempty, Set.singleton ix)
         go (SSwitch s e) = go s >> goE e
         go (SShare s) = go s
 
-        goE :: Event t a -> State (IntSet, IntSet) ()
+        goE :: Event t a -> State (IntSet, IntSet, IntSet) ()
         goE (ERoot s) = go s
         goE (EMap _ e) = goE e
         goE (ETag e s) = goE e >> go s
         
         intMap  = UV.fromList (Set.toAscList intReachable)
+        intMapAll = UV.fromList (Set.toAscList intAll)
         intMap' = Map.fromList $ zip (Set.toAscList intReachable) [0..]
 
         fnMap   = UV.fromList (Set.toAscList fnReachable)
@@ -223,18 +229,21 @@ gc n@Network{..} =
         intCnt = UV.length intMap
         fnCnt  = UV.length fnMap
 
-        intState' = G.generate intCnt $ \ix -> netIntState G.! (intMap UV.! ix)
+        intState' = G.generate intCnt $ \ix -> netIntState G.! (intMapAll UV.! ix)
 
         restrictKeys m s = Map.filterWithKey (\k _ -> k `Set.member` s) m
-        intDeriv' = restrictKeys netIntDeriv intReachable
+        intDeriv' = fmap (rename intMap') $ restrictKeys netIntDeriv intReachable
 
         fnTime' = G.generate fnCnt $ \ix -> netFnTime G.! (fnMap UV.! ix)
+        root' = rename intMap' netRoot
+
+        -- intDeriv' = execWriter $ getDeriv root'
 
     in n
         { netIntState = intState'
-        , netIntDeriv = fmap (rename intMap') intDeriv'
+        , netIntDeriv = Map.mapKeys (\k -> intMap' Map.! k) intDeriv'
         , netFnTime = fnTime'
-        , netRoot = rename intMap' netRoot
+        , netRoot = root'
         }
 
 eventOccured :: Time t => Network t o -> Network t o -> Event t a -> Maybe a
@@ -248,6 +257,7 @@ eventOccured old new (ERoot s)
             oldS = evalSignal old s
             newS = evalSignal new s
 
+-- TODO: Switch integration derivs.
 runSwitches' :: forall v t o. Time t => Network t o -> Network t o -> (Bool, Network t o)
 runSwitches' old new =
     let
@@ -276,11 +286,15 @@ runSwitches' old new =
             s' <- go s
             return (ETag e' s')
         
-        ((root', Any changed), net') = addSim new $ runWriterT (go $ netRoot new) 
+        (((root', derivs'), Any changed), net') = addSim new $ runWriterT $ do
+            newRoot <- go $ netRoot new
+            newDerivs <- mapM go $ netIntDeriv new
+            return (newRoot, newDerivs)
     in 
         if changed
         then (changed, gc $ net'
             { netRoot = root'
+            , netIntDeriv = derivs'
             })
         else (changed, new)
         
@@ -731,3 +745,10 @@ ex6 = do
         b = fmap (trace "Calc B") $ 5 + 2
     return $ V4 <$> a <*> a <*> b <*> b
 
+ex7 :: (Ord t, Floating t, Time t) => Sim t (Signal t t)
+ex7 = do
+    s <- timeFn sin
+    let
+        e = root s
+        s1 = becomeOn 0 e (\_ -> pure $ signum s)
+    integral 0 s1
