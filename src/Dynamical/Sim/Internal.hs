@@ -127,6 +127,15 @@ instance Functor (Event t) where
 -- | The `Sim t` monad is used for constructing certain `Signal` values.
 newtype Sim t a = Sim {unSim :: forall o. State (Network t o) a}
 
+instance Num a => Num (Sim t a) where
+    fromInteger = pure . fromInteger
+    (+) = liftA2 (+)
+    (*) = liftA2 (*)
+    abs = fmap abs
+    signum = fmap signum
+    negate = fmap negate
+
+
 instance Functor (Sim t) where
     fmap f (Sim s) = Sim (fmap f s)
 
@@ -761,11 +770,12 @@ ex7 = do
 timer :: (Num t, Time t, Ord t) => t -> Sim t (Event t ())
 timer duration = timeFn (\t -> duration - t) >>= pure . root
 
-stepAndHold :: (Num t, Ord t, Time t) => [(t,a)] -> Sim t (Signal t a) -> Sim t (Signal t a)
+stepAndHold :: (Num t, Ord t, Time t) => [(t,Sim t (Signal t a))] -> Sim t (Signal t a) -> Sim t (Signal t a)
 stepAndHold [] a = a
 stepAndHold ((t,a):ls) last = do
     e <- timer t
-    return $ pure a `becomeOn` e $ \_ -> stepAndHold ls last
+    s <- a
+    return $ s `becomeOn` e $ \_ -> stepAndHold ls last
 
 ex8 :: (Ord t, Floating t, Time t) => Sim t (Signal t (t,t))
 ex8 = do
