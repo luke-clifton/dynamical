@@ -211,31 +211,32 @@ gc n@Network{..} =
         intMap' = Map.fromList $ zip (Set.toAscList intReachable) [0..]
 
         fnMap   = UV.fromList (Set.toAscList fnReachable)
+        fnMap' = Map.fromList $ zip (Set.toAscList fnReachable) [0..]
 
-        rename :: IntMap Int -> Signal t a -> Signal t a
-        rename m (SAp a b) = SAp (rename m a) (rename m b)
-        rename m (SMap f a) = SMap f (rename m a)
-        rename m s@(SPure _) = s
-        rename m (SInt ix) = SInt (m Map.! ix)
-        rename m s@SFn{} = s
-        rename m (SSwitch s e) = SSwitch (rename m s) (renameE m e)
-        rename m (SShare s) = SShare (rename m s)
+        rename :: Signal t a -> Signal t a
+        rename (SAp a b) = SAp (rename a) (rename b)
+        rename (SMap f a) = SMap f (rename a)
+        rename s@(SPure _) = s
+        rename (SInt ix) = SInt (intMap' Map.! ix)
+        rename (SFn ix f) = SFn (fnMap' Map.! ix) f
+        rename (SSwitch s e) = SSwitch (rename s) (renameE e)
+        rename (SShare s) = SShare (rename s)
 
-        renameE :: IntMap Int -> Event t a -> Event t a
-        renameE m (ERoot s) = ERoot (rename m s)
-        renameE m (EMap f e) = EMap f (renameE m e)
-        renameE m (ETag e s) = ETag (renameE m e) (rename m s)
+        renameE :: Event t a -> Event t a
+        renameE (ERoot s) = ERoot (rename s)
+        renameE (EMap f e) = EMap f (renameE e)
+        renameE (ETag e s) = ETag (renameE e) (rename s)
 
         intCnt = UV.length intMap
         fnCnt  = UV.length fnMap
-
+    
         intState' = G.generate intCnt $ \ix -> netIntState G.! (intMapAll UV.! ix)
 
         restrictKeys m s = Map.filterWithKey (\k _ -> k `Set.member` s) m
-        intDeriv' = fmap (rename intMap') $ restrictKeys netIntDeriv intReachable
+        intDeriv' = fmap rename $ restrictKeys netIntDeriv intReachable
 
         fnTime' = G.generate fnCnt $ \ix -> netFnTime G.! (fnMap UV.! ix)
-        root' = rename intMap' netRoot
+        root' = rename netRoot
 
         -- intDeriv' = execWriter $ getDeriv root'
 
@@ -245,6 +246,10 @@ gc n@Network{..} =
         , netFnTime = fnTime'
         , netRoot = root'
         }
+
+v !!! i = case v G.!? i of
+    Nothing -> error "XXXXXXXXXXXXX"
+    Just x -> x
 
 eventOccured :: Time t => Network t o -> Network t o -> Event t a -> Maybe a
 eventOccured old new (EMap f e) = f <$> eventOccured old new e
@@ -752,3 +757,18 @@ ex7 = do
         e = root s
         s1 = becomeOn 0 e (\_ -> pure $ signum s)
     integral 0 s1
+
+timer :: (Num t, Time t, Ord t) => t -> Sim t (Event t ())
+timer duration = timeFn (\t -> duration - t) >>= pure . root
+
+stepAndHold :: (Num t, Ord t, Time t) => [(t,a)] -> Sim t (Signal t a) -> Sim t (Signal t a)
+stepAndHold [] a = a
+stepAndHold ((t,a):ls) last = do
+    e <- timer t
+    return $ pure a `becomeOn` e $ \_ -> stepAndHold ls last
+
+ex8 :: (Ord t, Floating t, Time t) => Sim t (Signal t (t,t))
+ex8 = do
+    d <- stepAndHold [(0.5,1),(0.2, -2),(1,0)] (timeFn sin)
+    i <- integral 0 d
+    return $ (,) <$> d <*> i
