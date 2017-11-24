@@ -1,10 +1,14 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RecursiveDo #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -15,13 +19,15 @@
 module Dynamical.Sim.Internal where
 
 import Control.Applicative
+import Control.DeepSeq (force, NFData(..))
 import Control.Monad
 import Control.Monad.Fix (MonadFix(mfix))
 import Control.Monad.State (StateT, State, get, put, runState, modify, execState, evalState)
 import Control.Monad.Trans (lift)
 import Control.Monad.Writer (Writer, tell, WriterT, runWriterT)
 import Data.Complex (Complex((:+)))
-import Data.Fixed (Fixed)
+import Data.Default.Class (Default(def))
+import Data.Fixed (Fixed, mod')
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as Map
 import Data.IntSet (IntSet)
@@ -39,11 +45,16 @@ import qualified Data.Vector.Generic.Mutable as GM
 import qualified Data.Vector.Mutable as VM
 import qualified Data.Vector.Unboxed as UV
 import qualified Data.Vector.Unboxed.Mutable as UM
-import Debug.Trace
+import qualified Debug.Trace as Dbg
+import GHC.Generics (Generic)
 import qualified GHC.Prim as Prim
-import Linear (V1(..), V2(..), V3(..), V4(..), norm)
-import System.IO.Unsafe (unsafePerformIO)
+import GHC.TypeLits (Symbol, symbolVal, KnownSymbol)
+import qualified Graphics.Rendering.Chart.Backend.Cairo as Chart
+import qualified Graphics.Rendering.Chart.Easy as Chart
+import Linear (V1(..), V2(..), angle, V3(..), V4(..), norm, _x, _y,_z,_w, qd,Additive(..),signorm,(*^),(^/), perp)
+import System.IO.Unsafe (unsafePerformIO, unsafeInterleaveIO)
 import System.Mem.StableName (hashStableName,eqStableName,StableName,makeStableName)
+import Text.Printf (printf, PrintfArg)
 import Unsafe.Coerce (unsafeCoerce)
 
 -------------------------------------------------------------------
@@ -60,6 +71,7 @@ data Signal t a where
     SFn     :: Int -> (t -> a) -> Signal t a
     SSwitch :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
     SShare  :: Signal t a -> Signal t a
+
 
 instance Functor (Signal t) where
     fmap = SMap
@@ -100,7 +112,6 @@ instance Floating a => Floating (Signal t a) where
     asinh = fmap asinh
     acosh = fmap acosh
     atanh = fmap atanh
-
 
 -------------------------------------------------------------------
 -- Event
@@ -170,15 +181,16 @@ type instance NetStoreVec Scientific = V.Vector
 type NetStore t = NetStoreVec t t
 type NetStoreMut t = G.Mutable (NetStoreVec t) t
 
-type Time t = (G.Vector (NetStoreVec t) t, Show (NetStore t))
+type Time t = (Show t, NFData (NetStore t), NFData t, G.Vector (NetStoreVec t) t, Show (NetStore t))
 
 -- | A `Network` represents a compiled simulation.
 data Network t o = Network
-    { netIntState :: NetStore t
-    , netIntDeriv :: IntMap (Signal t (NetStore t))
-    , netFnTime   :: NetStore t
-    , netRoot     :: Signal t o
-    }
+    { netIntState :: !(NetStore t)
+    , netIntDeriv :: !(IntMap (Signal t (NetStore t)))
+    , netFnTime   :: !(NetStore t)
+    , netRoot     :: (Signal t o)
+    } deriving (Generic)
+
 
 -- TODO: Rewrite
 
@@ -214,7 +226,7 @@ gc n@Network{..} =
         goE (ERoot s) = go s
         goE (EMap _ e) = goE e
         goE (ETag e s) = goE e >> go s
-        
+
         intMap  = UV.fromList (Set.toAscList intReachable)
         intMapAll = UV.fromList (Set.toAscList intAll)
         intMap' = Map.fromList $ zip (Set.toAscList intReachable) [0..]
@@ -238,7 +250,7 @@ gc n@Network{..} =
 
         intCnt = UV.length intMap
         fnCnt  = UV.length fnMap
-    
+
         intState' = G.generate intCnt $ \ix -> netIntState G.! (intMapAll UV.! ix)
 
         restrictKeys m s = Map.filterWithKey (\k _ -> k `Set.member` s) m
@@ -256,10 +268,6 @@ gc n@Network{..} =
         , netRoot = root'
         }
 
-v !!! i = case v G.!? i of
-    Nothing -> error "XXXXXXXXXXXXX"
-    Just x -> x
-
 eventOccured :: Time t => Network t o -> Network t o -> Event t a -> Maybe a
 eventOccured old new (EMap f e) = f <$> eventOccured old new e
 eventOccured old new (ETag e s) = flip (,) (evalSignal new s) <$> eventOccured old new e
@@ -271,7 +279,6 @@ eventOccured old new (ERoot s)
             oldS = evalSignal old s
             newS = evalSignal new s
 
--- TODO: Switch integration derivs.
 runSwitches' :: forall v t o. Time t => Network t o -> Network t o -> (Bool, Network t o)
 runSwitches' old new =
     let
@@ -299,19 +306,19 @@ runSwitches' old new =
             e' <- goE e
             s' <- go s
             return (ETag e' s')
-        
+
         (((root', derivs'), Any changed), net') = addSim new $ runWriterT $ do
             newRoot <- go $ netRoot new
             newDerivs <- mapM go $ netIntDeriv new
             return (newRoot, newDerivs)
-    in 
+    in
         if changed
         then (changed, gc $ net'
             { netRoot = root'
             , netIntDeriv = derivs'
             })
         else (changed, new)
-        
+
 runSwitches old new = snd $ runSwitches' old new
 anyEvent old new = fst $ runSwitches' old new
 
@@ -402,8 +409,8 @@ evalSignal''' c = go
 
 evalSignal :: forall t o a. Time t => Network t o -> Signal t a -> a
 --evalSignal n s = evalState (evalSignal' n s) mempty
---evalSignal = evalSignal''
-evalSignal = evalSignal'''
+evalSignal = evalSignal''
+--evalSignal = evalSignal'''
 --evalSignal n = memo (evalSignal'' n)
 --{-# NOINLINE evalSignal #-}
 
@@ -411,7 +418,10 @@ evalRoot :: Time t => Network t o -> o
 evalRoot c = evalSignal c (netRoot c)
 
 deltaNet :: (Num t, Time t) => Network t o -> t -> NetStore t -> Network t o
-deltaNet n@Network{..} h dv = (deltaNetTime n h)
+deltaNet n@Network{..} h dv = deltaNetState (deltaNetTime n h) dv
+
+deltaNetState :: (Num t, Time t) => Network t o -> NetStore t -> Network t o
+deltaNetState n@Network{..} dv = n
     { netIntState = G.zipWith (+) netIntState dv
     }
 
@@ -563,48 +573,89 @@ tag  = ETag
 -- Simulation
 -------------------------------------------------------------------
 
+data SimResult t o = SimResult
+    { stepNumber :: !Integer
+    , globalTime :: !t
+    , result     :: !o
+    } deriving (Eq, Ord, Show, Functor)
+
+asTuple :: SimResult t o -> (t,o)
+asTuple (SimResult _ t o) = (t,o)
+
 -- | Run the `Integrator` over the given `Signal` outputting a list of
 -- time stamp and `Network`s.
-simulate' :: forall v t o. (Num t, Time t) => Integrator t o -> Sim t (Signal t o) -> [(t,Network t o)]
+simulate'
+    :: forall v t o. (Num t, Time t)
+    => Integrator t o -> Sim t (Signal t o) -> [SimResult t (Network t o)]
 simulate' integrator s =
     let
         n = newSim s
-    in unfoldr (\(i,n,t) ->
+    in unfoldr (\(cnt,i,n,t) ->
         let
             (n',r,i') =  runIntegrator i n
             t' = t + r
         in
-            Just ( (t, n)        -- Previous step
-                 , (i', n', t')
-                 )
-        ) (integrator,n,0)
+            cnt `seq` t `seq` n  `seq` (Just $!
+                ( SimResult cnt t n   -- Previous step
+                , (succ cnt, i', n', t')
+                ))
+        ) (0,integrator,n,0)
 
 -- | Run the `Integrator` over the given `Signal`, outputting a list of
 -- time stamp and signal values.
-simulate :: (Num t, Time t) => Integrator t o -> Sim t (Signal t o) -> [(t,o)]
+simulate :: (Num t, Time t) => Integrator t o -> Sim t (Signal t o) -> [SimResult t o]
 simulate i s = fmap evalRoot <$> simulate' i s
+
+-- | Causes progress messages to be printed every 100 steps. Uses lazy IO,
+-- so be careful.
+--  TODO: Rejig things to be more streamy.
+trace :: (Show t, Show o, PrintfArg t) => [SimResult t o] -> IO [SimResult t o]
+trace [] = return []
+trace (s@(SimResult c t o):rest)
+    | 0 == c `mod` 100 = do
+        printf "S: %5d  T: %5.3v  V: " c t
+        putStrLn $ show o
+        r <- unsafeInterleaveIO $ trace rest
+        return $ s : r
+    | otherwise = do
+        r <- unsafeInterleaveIO $ trace rest
+        return $ s : r
 
 -- | `simulate'` specialised to `Double`
 simulateDouble'
     :: Integrator Double o
     -> Sim Double (Signal Double o)
-    -> [(Double,Network Double o)]
+    -> [SimResult Double (Network Double o)]
 simulateDouble' = simulate'
 
 -- | `simulate` specialised to `Double`
 simulateDouble
     :: Integrator Double o
     -> Sim Double (Signal Double o)
-    -> [(Double,o)]
+    -> [SimResult Double o]
 simulateDouble = simulate
 
 -- | `simulate` which stops as soon as the `Signal` value becomes `Nothing`
-simulateJust :: (Num t, Time t) => Integrator t (Maybe o) -> Sim t (Signal t (Maybe o)) -> [(t,o)]
-simulateJust i s = fmap (\(t,Just x) -> (t,x)) $ takeWhile (isJust . snd) $ simulate i s
+simulateJust :: (Num t, Time t) => Integrator t (Maybe o) -> Sim t (Signal t (Maybe o)) -> [SimResult t o]
+simulateJust i s = fmap (\(SimResult n t (Just x)) -> SimResult n t x) $ takeWhile (isJust . result) $ simulate i s
 
 -- | `simulateJust` specialised to `Double`
-simulateJustDouble :: Integrator Double (Maybe o) -> Sim Double (Signal Double (Maybe o)) -> [(Double,o)]
+simulateJustDouble :: Integrator Double (Maybe o) -> Sim Double (Signal Double (Maybe o)) -> [SimResult Double o]
 simulateJustDouble = simulateJust
+
+-- | Simulate until the specified time is reached. The termination time is
+-- marked by an `Event`, meaning that adaptive integration methods which
+-- narrow down on event locations will be do so to get accurate finishing
+-- times.
+simulateUntil :: (Ord t, Num t, Time t) => t -> Integrator t (Maybe o) -> Sim t (Signal t o) -> [SimResult t o]
+simulateUntil duration i s = simulateJust i $ do
+    t <- timer duration
+    s' <- s
+    return $ s' `becomeNothingOn` t
+
+-- | `simulateUntil` specialised to `Double`
+simulateUntilDouble :: Double -> Integrator Double (Maybe o) -> Sim Double (Signal Double o) -> [SimResult Double o]
+simulateUntilDouble = simulateUntil
 
 -- | Run a simulation in real time, printing the result values to the terminal.
 runRk4RealTime :: forall a. Show a => Sim Double (Signal Double a) -> IO ()
@@ -641,6 +692,15 @@ runRk4RealTimeJust s =
         now <- getCurrentTime
         go now n
 
+sample :: (Ord t, Real t) => t -> [(t,a)] -> [(t,a)]
+sample freq = go 500
+    where
+        go _ [] = []
+        go n ((t,r):xs)
+            | t' < n = (t,r) : go t' xs
+            | otherwise = go t' xs
+            where
+                t' = t `mod'` freq
 
 -------------------------------------------------------------------
 -- Integrators
@@ -648,10 +708,12 @@ runRk4RealTimeJust s =
 
 newtype Integrator t o = Integrator
     { runIntegrator :: Network t o -> (Network t o, t, Integrator t o)
-    }
+    } deriving Generic
 
-euler :: (Num t, Time t) => t -> Integrator t o
-euler h = integrator
+instance NFData (Integrator t o)
+
+eulerSimple :: (Num t, Time t) => t -> Integrator t o
+eulerSimple h = integrator
     where
         integrator = Integrator go
         go n =
@@ -676,8 +738,63 @@ eulerBisect tol h = integrator
                     | e && h' > tol = go (h'/2) n
                     | otherwise = (n'', h', integrator)
             in res
-                
 
+-- | Configuration for adaptive methods.
+--
+-- Unchecked assumptions: 0 < `minStep` < `eventTolerance` < `maxStep`
+data AdaptiveConfig t = AdaptiveConfig
+    { minStep :: Maybe t
+    , maxStep :: Maybe t
+    , tolerance :: t
+    , eventTolerance :: t
+    }
+
+instance Fractional t => Default (AdaptiveConfig t) where
+    def = AdaptiveConfig
+        { minStep = Nothing
+        , maxStep = Nothing
+        , tolerance = 0.001
+        , eventTolerance = 0.001
+        }
+
+-- If maxStep < minStep, we choose maxStep always.
+adaptiveClamp :: Ord t => AdaptiveConfig t -> t -> t
+adaptiveClamp AdaptiveConfig{..} t =
+    let
+        t' = maybe t (max t) minStep
+    in
+        maybe t' (min t') maxStep
+
+clamp :: Ord a => a -> a -> a -> a
+clamp l h t
+    | t < l = l
+    | t > h = h
+    | otherwise = t
+
+euler :: (Ord t, Fractional t, Time t, Show t) => AdaptiveConfig t -> Integrator t o
+euler conf@AdaptiveConfig{..} = Integrator $ go 0.1
+    where
+        go h n =
+            let
+                eulStep h n = deltaNet n h (G.map (*h) (derivsNow n))
+
+                n10  = eulStep h n
+                n1_2 = eulStep (h/2) n
+                n11  = eulStep (h/2) n1_2
+                tau  = G.zipWith (-) (netIntState n11) (netIntState n10)
+                tau' = G.maximum $ G.map abs tau
+                n12  = deltaNetState n11 tau
+
+                h' = adaptiveClamp conf $ 0.9 * h * clamp 0.3 3 (tolerance / tau')
+
+                (e,n') = runSwitches' n n12
+
+                res
+                    | e && h > eventTolerance && h > fromMaybe 0 minStep
+                        = go (adaptiveClamp conf (h/2)) n
+                    | tau' > tolerance && h' > fromMaybe 0 minStep = go h' n
+                    | otherwise = (n', h, Integrator $ go h')
+            in res
 
 rk4 :: (Fractional t, Time t) => t -> Integrator t o
 rk4 h = integrator
@@ -698,6 +815,116 @@ rk4 h = integrator
 
 
 -------------------------------------------------------------------
+-- Visualisation
+-------------------------------------------------------------------
+
+class Plot a where
+    plot :: [SimResult Double a] -> Chart.EC (Chart.Layout Double Double) ()
+
+newtype a ::: (name :: Symbol) = Named a
+    deriving (Read,Enum,Real,RealFrac,RealFloat,Eq,Ord,Show,Num,Fractional,Floating,Chart.PlotValue)
+
+infixr 0 :::
+
+instance Plot Double where
+    plot = Chart.plot . Chart.points "" . fmap asTuple
+
+instance (KnownSymbol name, Chart.PlotValue a) => Plot (a ::: name) where
+    plot = Chart.plot . Chart.points name . fmap (fmap Chart.toValue) . fmap asTuple
+        where
+            name = symbolVal (Proxy :: Proxy name)
+
+instance (Plot a, Plot b) => Plot (a,b) where
+    plot as = do
+        plot (fmap fst <$> as)
+        plot (fmap snd <$> as)
+
+instance (Plot a, Plot b, Plot c) => Plot (a,b,c) where
+    plot as = do
+        plot (fmap (\(a,_,_) -> a) <$> as)
+        plot (fmap (\(_,b,_) -> b) <$> as)
+        plot (fmap (\(_,_,c) -> c) <$> as)
+
+instance Plot a => Plot (V2 a) where
+    plot as = do
+        plot (fmap (Chart.^. _x) <$> as)
+        plot (fmap (Chart.^. _y) <$> as)
+
+instance Plot a => Plot (V4 a) where
+    plot as = do
+        plot (fmap (Chart.^. _x) <$> as)
+        plot (fmap (Chart.^. _y) <$> as)
+        plot (fmap (Chart.^. _z) <$> as)
+        plot (fmap (Chart.^. _w) <$> as)
+
+plotSimUntil
+    :: Plot o
+    => Double
+    -> Integrator Double (Maybe o)
+    -> Sim Double (Signal Double o)
+    -> Chart.EC (Chart.Layout Double Double) ()
+plotSimUntil t i s = plot (simulateUntil t i s)
+
+plotSimUntilToFile n title t i s = do
+    r <- trace $ simulateUntil t i s
+    Chart.toFile Chart.def n $ do
+        Chart.layout_title Chart..= title
+        plot r
+
+class PlotPara a where
+    plotPara :: [SimResult Double a] -> Chart.EC (Chart.Layout Double Double) ()
+
+instance PlotPara (V2 Double) where
+    plotPara = Chart.plot . Chart.line "" . (:[]) . fmap (\(SimResult n t (V2 a b)) -> (a,b))
+
+instance (KnownSymbol name) => PlotPara (V2 Double ::: name) where
+    plotPara = Chart.plot . Chart.line name . (:[]) . fmap (\(SimResult n t (Named (V2 a b))) -> (a,b))
+        where
+            name = symbolVal (Proxy :: Proxy name)
+
+instance (PlotPara a, PlotPara b) => PlotPara (a,b) where
+    plotPara as = do
+        plotPara (fmap fst <$> as)
+        plotPara (fmap snd <$> as)
+
+instance (PlotPara a, PlotPara b, PlotPara c) => PlotPara (a,b,c) where
+    plotPara as = do
+        plotPara (fmap (\(a,_,_) -> a) <$> as)
+        plotPara (fmap (\(_,b,_) -> b) <$> as)
+        plotPara (fmap (\(_,_,c) -> c) <$> as)
+
+plotParaSimUntil
+    :: PlotPara o
+    => Double
+    -> Integrator Double (Maybe o)
+    -> Sim Double (Signal Double o)
+    -> Chart.EC (Chart.Layout Double Double) ()
+plotParaSimUntil t i s = plotPara $ simulateUntil t i s
+
+plotParaSimUntilToFile n title t i s = do
+    r <- trace $ simulateUntil t i s
+    Chart.toFile Chart.def n $ do
+        Chart.layout_title Chart..= title
+        plotPara r
+
+-------------------------------------------------------------------
+-- Utility
+-------------------------------------------------------------------
+
+-- | Applicative tupples
+(-:) :: Applicative f => f a -> f b -> f (a,b)
+(-:) = liftA2 (,)
+infixr 5 -:
+
+-- | Applicative `Named` tuples.
+(-::) :: Applicative f => f a -> f b -> f (a ::: an, b ::: bn)
+a -:: b = (,) <$> (Named <$> a) <*> (Named <$> b)
+infixr 5 -::
+
+threeNames :: Applicative f => f a -> f b -> f c -> f (a ::: an, b ::: nm, c ::: cn)
+threeNames a b c = (,,) <$> (Named <$> a) <*> (Named <$> b) <*> (Named <$> c)
+
+-------------------------------------------------------------------
 -- Examples/Test
 -------------------------------------------------------------------
 
@@ -706,7 +933,7 @@ ex1 :: (Time t, Fractional t) => Sim t (Signal t (t, t))
 ex1 = do
     rec a <- integral 0.5 a
     b <- integral 0 1
-    return $ (,) <$> a <*> b
+    return $ a -: b
 
 -- Ex2 shows how to use `become` to change a singal to a new one upon
 -- an event.
@@ -729,11 +956,16 @@ ex3 = do
 
 
 -- Ex4 can be used to demonstrate the accuracy of various integrators.
-ex4 :: (Floating t, Time t) => Sim t (Signal t (t,t))
+ex4
+    :: (Floating t, Time t)
+    => Sim t (Signal t
+        ( t ::: "sin(t)"
+        , t ::: "∫∫∫∫sin(t)"
+        ))
 ex4 = do
     s <- timeFn sin
     s' <- integral (-1) s >>= integral 0 >>= integral 1 >>= integral 0
-    return $ (,) <$> s <*> s'
+    return $ s -:: s'
 
 -- Ex5 demonstrates using `Maybe` to terminate a simulation with
 -- `simulateJust`.
@@ -751,12 +983,13 @@ ex5 = do
 
 -- Ex6 demonstrates the use of `share` to reduce the number
 -- of times a signal is evaluated. The trace will show
--- "Calc A" once, but "Calc B" twice.
+-- "Calc A" once, but "Calc B" twice when using an explicit
+-- sharing eval strategy.
 ex6 :: (Time t, Floating t) => Sim t (Signal t (V4 t))
 ex6 = do
     let
-        a = share $ fmap (trace "Calc A") $ 5 + 2
-        b = fmap (trace "Calc B") $ 5 + 2
+        a = share $ fmap (Dbg.trace "Calc A") $ 5 + 2
+        b = fmap (Dbg.trace "Calc B") $ 5 + 2
     return $ V4 <$> a <*> a <*> b <*> b
 
 ex7 :: (Ord t, Floating t, Time t) => Sim t (Signal t t)
@@ -777,8 +1010,66 @@ stepAndHold ((t,a):ls) last = do
     s <- a
     return $ s `becomeOn` e $ \_ -> stepAndHold ls last
 
-ex8 :: (Ord t, Floating t, Time t) => Sim t (Signal t (t,t))
+ex8 :: (Ord t, Floating t, Time t) => Sim t (Signal t (Maybe (t ::: "Deriv",t ::: "Integral")))
 ex8 = do
+    t <- timer 6
     d <- stepAndHold [(0.5,1),(0.2, -2),(1,0)] (timeFn sin)
     i <- integral 0 d
-    return $ (,) <$> d <*> i
+    let r = d -:: i
+    return $ r `becomeNothingOn` t
+
+ex9
+    :: forall t. (Floating t, Time t)
+    => Sim t (Signal t 
+        ( V2 t ::: "Sun"
+        , V2 t ::: "Earth"
+        , V2 t ::: "Moon"
+        ))
+ex9 = do
+    rec
+        let
+            degRad :: t -> t
+            degRad t = t / 180 * pi
+
+            pos2init = 149.6e9 *^ angle $ degRad 3.201e2
+            pos3init = pos2init + 384.4e6 *^ angle (degRad 2.0644e2)
+
+        pos1 <- integral (V2 0 0) vel1
+        pos2 <- integral pos2init vel2
+        pos3 <- integral pos3init vel3
+
+        let
+            vel2init = 29766.42101876582 *^ signorm (perp pos2init)
+            vel3init = vel2init + 1023.005 *^ (signorm (perp pos3init))
+        vel1 <- integral (V2 0 0) acc1
+        vel2 <- integral vel2init acc2
+        vel3 <- integral vel3init acc3
+
+        let
+            g = 6.674e-11
+            m1 = 1.9891e30
+            m2 = 5.972e24
+            m3 = 7.347e22
+            -- f = g * m1 * m2 / r^2 = m1 * a
+            dir :: Signal t (V2 t) -> Signal t (V2 t) -> Signal t t -> Signal t (V2 t)
+            dir a b c =
+                let
+                    d = (^-^) <$> b <*> a
+                    u = signorm <$> d
+                in (*^) <$> c <*> u
+            f1 = sum
+                [ dir pos1 pos2 $ g * m1 * m2 / (qd <$> pos1 <*> pos2)
+                , dir pos1 pos3 $ g * m1 * m3 / (qd <$> pos1 <*> pos3)
+                ]
+            f2 = sum
+                [ dir pos2 pos1 $ g * m2 * m1 / (qd <$> pos2 <*> pos1)
+                , dir pos2 pos3 $ g * m2 * m3 / (qd <$> pos2 <*> pos3)
+                ]
+            f3 = sum
+                [ dir pos3 pos1 $ g * m3 * m1 / (qd <$> pos3 <*> pos1)
+                , dir pos3 pos2 $ g * m3 * m2 / (qd <$> pos3 <*> pos2)
+                ]
+            acc1 = (^/) <$> f1 <*> m1
+            acc2 = (^/) <$> f2 <*> m2
+            acc3 = (^/) <$> f3 <*> m3
+    return $ threeNames pos1 pos2 pos3

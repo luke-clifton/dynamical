@@ -27,6 +27,9 @@ library
     containers >=0.5 && <0.6,
     Chart >=1.8 && <1.9,
     Chart-diagrams >=1.8 && <1.9,
+    Chart-cairo >=1.8 && <1.9,
+    data-default-class,
+    deepseq,
     linear,
     scientific,
     stable-memo,
@@ -36,3 +39,12 @@ library
   hs-source-dirs: src
 
   default-language: Haskell2010
+
+executable solar
+  build-depends:
+    base,
+    data-default-class,
+    dynamical
+  main-is: solar.hs
+  hs-source-dirs: examples
+  ghc-options: -O2
