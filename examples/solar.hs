@@ -6,7 +6,7 @@ import Data.Default.Class
 main :: IO ()
 main = do
     plotParaSimUntilToFile
-        "grav.svg"
+        "grav.png"
         "Gravity"
         15552000 -- 180 days
         (rk4 100)

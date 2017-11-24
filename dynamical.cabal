@@ -47,4 +47,4 @@ executable solar
     dynamical
   main-is: solar.hs
   hs-source-dirs: examples
-  ghc-options: -O2
+  ghc-options: -O2 -fllvm
