@@ -18,7 +18,8 @@ cabal-version:       >=1.10
 library
   exposed-modules:
     Dynamical.Sim,
-    Dynamical.Sim.Internal
+    Dynamical.Sim.Internal,
+    Dynamical.Sim.Gravity
 
   build-depends:
     base >=4.9 && <4.10,

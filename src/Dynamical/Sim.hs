@@ -5,6 +5,12 @@ module Dynamical.Sim
     , rk4
     , becomeOn
     , switch
+    , Signal
+    , integral
+    , Sim
+    , Splat
+    , Time
+    , (:::)(..)
     ) where
 
 import Dynamical.Sim.Internal

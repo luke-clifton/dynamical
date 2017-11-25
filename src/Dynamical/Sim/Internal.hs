@@ -72,6 +72,9 @@ data Signal t a where
     SSwitch :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
     SShare  :: Signal t a -> Signal t a
 
+instance Monoid a => Monoid (Signal t a) where
+    mempty = pure mempty
+    mappend = liftA2 mappend
 
 instance Functor (Signal t) where
     fmap = SMap
@@ -181,7 +184,7 @@ type instance NetStoreVec Scientific = V.Vector
 type NetStore t = NetStoreVec t t
 type NetStoreMut t = G.Mutable (NetStoreVec t) t
 
-type Time t = (Show t, NFData (NetStore t), NFData t, G.Vector (NetStoreVec t) t, Show (NetStore t))
+type Time t = (Show t, G.Vector (NetStoreVec t) t, Show (NetStore t))
 
 -- | A `Network` represents a compiled simulation.
 data Network t o = Network
