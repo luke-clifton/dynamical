@@ -29,10 +29,12 @@ import Data.Complex (Complex((:+)))
 import Data.Default.Class (Default(def))
 import Data.Fixed (Fixed, mod')
 import Data.IntMap.Strict (IntMap)
-import qualified Data.IntMap.Strict as Map
+import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as Set
 import Data.List
+import Data.Map (Map)
+import qualified Data.Map as Map
 import Data.Maybe
 import Data.Monoid (Monoid(), Any(Any), (<>), mempty, mappend)
 import Data.Proxy (Proxy(Proxy))
@@ -191,7 +193,7 @@ data Network t o = Network
     { netIntState :: !(NetStore t)
     , netIntDeriv :: !(IntMap (Signal t (NetStore t)))
     , netFnTime   :: !(NetStore t)
-    , netRoot     :: (Signal t o)
+    , netRoot     :: (Signal t o)  -- TODO: Make this a container of signals?
     } deriving (Generic)
 
 
@@ -217,7 +219,7 @@ gc n@Network{..} =
                     len = splen pt pa - 1
                     names = Set.fromList [ix..ix + len]
                 put (i `Set.union` names, Set.insert ix i', f)
-                go (netIntDeriv Map.! ix)
+                go (netIntDeriv IntMap.! ix)
         go (SAp a b) = go a >> go b
         go (SMap _ s) = go s
         go (SPure _) = return ()
@@ -232,17 +234,17 @@ gc n@Network{..} =
 
         intMap  = UV.fromList (Set.toAscList intReachable)
         intMapAll = UV.fromList (Set.toAscList intAll)
-        intMap' = Map.fromList $ zip (Set.toAscList intReachable) [0..]
+        intMap' = IntMap.fromList $ zip (Set.toAscList intReachable) [0..]
 
         fnMap   = UV.fromList (Set.toAscList fnReachable)
-        fnMap' = Map.fromList $ zip (Set.toAscList fnReachable) [0..]
+        fnMap' = IntMap.fromList $ zip (Set.toAscList fnReachable) [0..]
 
         rename :: Signal t a -> Signal t a
         rename (SAp a b) = SAp (rename a) (rename b)
         rename (SMap f a) = SMap f (rename a)
         rename s@(SPure _) = s
-        rename (SInt ix) = SInt (intMap' Map.! ix)
-        rename (SFn ix f) = SFn (fnMap' Map.! ix) f
+        rename (SInt ix) = SInt (intMap' IntMap.! ix)
+        rename (SFn ix f) = SFn (fnMap' IntMap.! ix) f
         rename (SSwitch s e) = SSwitch (rename s) (renameE e)
         rename (SShare s) = SShare (rename s)
 
@@ -256,7 +258,7 @@ gc n@Network{..} =
 
         intState' = G.generate intCnt $ \ix -> netIntState G.! (intMapAll UV.! ix)
 
-        restrictKeys m s = Map.filterWithKey (\k _ -> k `Set.member` s) m
+        restrictKeys m s = IntMap.filterWithKey (\k _ -> k `Set.member` s) m
         intDeriv' = fmap rename $ restrictKeys netIntDeriv intReachable
 
         fnTime' = G.generate fnCnt $ \ix -> netFnTime G.! (fnMap UV.! ix)
@@ -266,7 +268,7 @@ gc n@Network{..} =
 
     in n
         { netIntState = intState'
-        , netIntDeriv = Map.mapKeys (\k -> intMap' Map.! k) intDeriv'
+        , netIntDeriv = IntMap.mapKeys (\k -> intMap' IntMap.! k) intDeriv'
         , netFnTime = fnTime'
         , netRoot = root'
         }
@@ -333,7 +335,7 @@ newSim (Sim s) =
     let
         (r,n) = runState s Network
             { netIntState = G.empty
-            , netIntDeriv = Map.empty
+            , netIntDeriv = IntMap.empty
             , netFnTime  = G.empty
             , netRoot = r
             }
@@ -363,7 +365,7 @@ evalSignal' c me@(SShare s) = do
         name = unsafePerformIO $ makeStableName me
         nameh = hashStableName name
         mv = do
-            (n,v) <- Map.lookup nameh m
+            (n,v) <- IntMap.lookup nameh m
             if eqStableName name n
             then return $ unsafeCoerce v
             else Nothing
@@ -371,7 +373,7 @@ evalSignal' c me@(SShare s) = do
         Just v -> return v
         Nothing -> do
             v' <- evalSignal' c s
-            put $ Map.insert nameh (unsafeCoerce name, unsafeCoerce v') m
+            put $ IntMap.insert nameh (unsafeCoerce name, unsafeCoerce v') m
             return v'
 evalSignal' c (SPure a) = return a
 evalSignal' c (SMap f s) = f <$> evalSignal' c s
@@ -440,7 +442,7 @@ derivs n h dv =
     in derivsNow n'
 
 derivsNow :: (Time t) => Network t o -> NetStore t
-derivsNow n = G.concat $ map (evalSignal n . snd) $ Map.toAscList $ netIntDeriv n
+derivsNow n = G.concat $ map (evalSignal n . snd) $ IntMap.toAscList $ netIntDeriv n
 
 
 -------------------------------------------------------------------
@@ -510,7 +512,7 @@ integral i s = Sim $ do
         ix = G.length (netIntState st)
     put st
         { netIntState = netIntState st G.++ sp
-        , netIntDeriv = Map.insert ix (fmap splat s) (netIntDeriv st)
+        , netIntDeriv = IntMap.insert ix (fmap splat s) (netIntDeriv st)
         }
     return $ SInt ix
 
@@ -895,6 +897,17 @@ instance (PlotPara a, PlotPara b, PlotPara c) => PlotPara (a,b,c) where
         plotPara (fmap (\(a,_,_) -> a) <$> as)
         plotPara (fmap (\(_,b,_) -> b) <$> as)
         plotPara (fmap (\(_,_,c) -> c) <$> as)
+
+instance PlotPara (Map String (V2 Double)) where
+    plotPara [] = return ()
+    plotPara as@(SimResult _ _ a : _) = do
+        let ks = Map.keys a
+        forM_ ks $ \k -> do
+            Chart.plot $ Chart.line k . (:[]) $ fmap (\(SimResult n t m) ->
+                let
+                    V2 a b = m Map.! k
+                in (a,b)
+                ) as
 
 plotParaSimUntil
     :: PlotPara o

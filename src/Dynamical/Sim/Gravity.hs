@@ -85,13 +85,11 @@ nbody ic = runBody ic $ do
         kp = [(a,b) | a <- k, b <- k, a > b]
     mapM_ (uncurry gravity) kp
     getMap
-    
 
-example :: Sim Double (Signal Double
-    ( (V2 Double) ::: "Earth"
-    , (V2 Double) ::: "Moon"
-    , (V2 Double) ::: "ISS"
-    ))
+mapToSignal :: Map k (Signal t a) -> Signal t (Map k a)
+mapToSignal = sequenceA
+
+example :: Sim Double (Signal Double (Map String (V2 Double)))
 example =
     let
         initialConditions = Map.fromList
@@ -99,12 +97,6 @@ example =
             , ("Moon" , makeBody (V2 384.4e6 0) (V2 0 1.022e3) 7.3477e22)
             , ("ISS"  , makeBody (V2 (6371e3 + 408.0e3) 0) (V2 0 7.66e3) 419.5e3)
             ]
-    in do
-        m <- nbody initialConditions
-        let
-            earth = bodyPos $ m Map.! "Earth"
-            moon  = bodyPos $ m Map.! "Moon"
-            iss   = bodyPos $ m Map.! "ISS"
-        return $ threeNames earth moon iss
+    in mapToSignal <$> fmap bodyPos <$> nbody initialConditions
 
 
