@@ -82,7 +82,7 @@ nbody :: (Eq k, Ord k, Metric v, Num (v t), Floating t) => Map k (Signal t (Forc
 nbody ic = runBody ic $ do
     let
         k = Map.keys ic
-        kp = [(a,b) | a <- k, b <- k, a /= b]
+        kp = [(a,b) | a <- k, b <- k, a > b]
     mapM_ (uncurry gravity) kp
     getMap
     
