@@ -901,9 +901,11 @@ instance (PlotPara a, PlotPara b, PlotPara c) => PlotPara (a,b,c) where
 instance PlotPara (Map String (V2 Double)) where
     plotPara [] = return ()
     plotPara as@(SimResult _ _ a : _) = do
-        let ks = Map.keys a
+        let
+            ks = Map.keys a
+            kk = if length ks > 10 then \_ -> "" else id
         forM_ ks $ \k -> do
-            Chart.plot $ Chart.line k . (:[]) $ fmap (\(SimResult n t m) ->
+            Chart.plot $ Chart.line (kk k) . (:[]) $ fmap (\(SimResult n t m) ->
                 let
                     V2 a b = m Map.! k
                 in (a,b)

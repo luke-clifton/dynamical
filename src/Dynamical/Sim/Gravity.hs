@@ -99,4 +99,16 @@ example =
             ]
     in mapToSignal <$> fmap bodyPos <$> nbody initialConditions
 
+example2 :: Sim Double (Signal Double (Map String (V2 Double)))
+example2 =
+    let
+        ic = Map.fromList $ do
+            i <- [0..10]
+            j <- [0..10]
+            let
+                x = 300e6 * fromIntegral i
+                y = 300e6 * fromIntegral j
 
+            return $ (show i ++ "_" ++ show j, makeBody (V2 x y) (V2 0 0) 5e20)
+    in
+        mapToSignal <$> fmap bodyPos <$> nbody ic
