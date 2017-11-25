@@ -59,6 +59,9 @@ runBody ic (BodyT b) = do
 applyForce :: Ord k => k -> Signal t (v t) -> BodyT k v t (Sim t) ()
 applyForce k f = BodyT $ tell (Map.singleton k (Force <$> f))
 
+getMap :: (Monad m, Ord k) => BodyT k v t m (Map k (Body v t))
+getMap = BodyT ask
+
 getBody :: (Monad m, Ord k) => k -> BodyT k v t m (Body v t)
 getBody k = BodyT $ asks $ (Map.! k)
 
@@ -75,7 +78,13 @@ gravity an bn = do
     applyForce an ((*^) <$> f <*> dirA)
     applyForce bn ((*^) <$> f <*> dirB)
 
-    
+nbody :: (Eq k, Ord k, Metric v, Num (v t), Floating t) => Map k (Signal t (Force v t) -> Sim t (Body v t)) -> Sim t (Map k (Body v t))
+nbody ic = runBody ic $ do
+    let
+        k = Map.keys ic
+        kp = [(a,b) | a <- k, b <- k, a /= b]
+    mapM_ (uncurry gravity) kp
+    getMap
     
 
 example :: Sim Double (Signal Double ((V2 Double) ::: "Moon"))
@@ -86,9 +95,9 @@ example =
             , ("Moon" , makeBody (V2 384.4e6 0) (V2 0 1.022e3) 7.3477e22)
             ]
     in do
-        moonPos <- runBody initialConditions $ do
-            gravity "Earth" "Moon"
-            bodyPos <$> getBody "Moon"
-        return $ Named <$> moonPos
+        m <- nbody initialConditions
+        let
+            moon = m Map.! "Moon"
+        return $ Named <$> bodyPos moon
 
 
