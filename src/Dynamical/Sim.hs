@@ -11,6 +11,7 @@ module Dynamical.Sim
     , Splat
     , Time
     , (:::)(..)
+    , threeNames
     ) where
 
 import Dynamical.Sim.Internal

@@ -87,17 +87,24 @@ nbody ic = runBody ic $ do
     getMap
     
 
-example :: Sim Double (Signal Double ((V2 Double) ::: "Moon"))
+example :: Sim Double (Signal Double
+    ( (V2 Double) ::: "Earth"
+    , (V2 Double) ::: "Moon"
+    , (V2 Double) ::: "ISS"
+    ))
 example =
     let
         initialConditions = Map.fromList
             [ ("Earth", makeBody 0 0 5.972e24)
             , ("Moon" , makeBody (V2 384.4e6 0) (V2 0 1.022e3) 7.3477e22)
+            , ("ISS"  , makeBody (V2 (6371e3 + 408.0e3) 0) (V2 0 7.66e3) 419.5e3)
             ]
     in do
         m <- nbody initialConditions
         let
-            moon = m Map.! "Moon"
-        return $ Named <$> bodyPos moon
+            earth = bodyPos $ m Map.! "Earth"
+            moon  = bodyPos $ m Map.! "Moon"
+            iss   = bodyPos $ m Map.! "ISS"
+        return $ threeNames earth moon iss
 
 
