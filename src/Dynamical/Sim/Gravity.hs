@@ -6,12 +6,12 @@
 {-# LANGUAGE RankNTypes #-}
 module Dynamical.Sim.Gravity where
 
-import qualified Data.Map as Map
-import Data.Map (Map)
-import Data.Monoid
-import Dynamical.Sim
 import Control.Monad.Reader
 import Control.Monad.Writer
+import Data.Map (Map)
+import qualified Data.Map as Map
+import Data.Monoid
+import Dynamical.Sim
 import Linear
 
 data Body v t = Body
