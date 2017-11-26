@@ -32,6 +32,7 @@ library
     data-default-class,
     deepseq,
     linear,
+    parallel,
     scientific,
     stable-memo,
     time,
@@ -57,4 +58,4 @@ executable nbody
     dynamical
   main-is: nbody.hs
   hs-source-dirs: examples
-  ghc-options: -O2 -fllvm
+  ghc-options: -O2 -fllvm -fprof-auto -rtsopts -threaded -eventlog

@@ -1,6 +1,6 @@
-{ mkDerivation, base, Chart, Chart-cairo, Chart-diagrams
+{ mkDerivation, lib, base, Chart, Chart-cairo, Chart-diagrams
 , containers, data-default-class, deepseq, ghc-prim, linear, mtl
-, scientific, stable-memo, stdenv, time, vector, llvm_37
+, scientific, stable-memo, stdenv, time, vector, llvm_37, enableExecutableProfiling ? false
 }:
 mkDerivation {
   pname = "dynamical";
@@ -16,4 +16,5 @@ mkDerivation {
   buildDepends = [llvm_37];
   description = "FRP based simulation of dynamical systems";
   license = stdenv.lib.licenses.bsd3;
+  configureFlags = lib.optionals enableExecutableProfiling ["--enable-executable-profiling"];
 }

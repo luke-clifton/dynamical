@@ -25,6 +25,8 @@ import Control.Monad.Fix (MonadFix(mfix))
 import Control.Monad.State (StateT, State, get, put, runState, modify, execState, evalState)
 import Control.Monad.Trans (lift)
 import Control.Monad.Writer (Writer, tell, WriterT, runWriterT)
+import Control.Parallel (pseq)
+import qualified Control.Parallel.Strategies as Par
 import Data.Complex (Complex((:+)))
 import Data.Default.Class (Default(def))
 import Data.Fixed (Fixed, mod')
@@ -212,7 +214,7 @@ type instance NetStoreVec Scientific = V.Vector
 type NetStore t = NetStoreVec t t
 type NetStoreMut t = G.Mutable (NetStoreVec t) t
 
-type Time t = (Show t, G.Vector (NetStoreVec t) t, Show (NetStore t))
+type Time t = (NFData (NetStoreVec t t), Show t, G.Vector (NetStoreVec t) t, Show (NetStore t))
 
 -- | A `Network` represents a compiled simulation.
 data Network t o = Network
@@ -442,16 +444,24 @@ evalSignal' c (SInt ix (f :: x -> a)) = do
 evalSignal' c (SSwitch s _) = evalSignal' c s
 
 evalSignal'' :: forall t o a. Time t => Network t o -> Signal t a -> a
-evalSignal'' c (SPure a) = a
-evalSignal'' c (SMap f s) = f $ evalSignal c s
-evalSignal'' c (SAdd a b) = evalSignal c a + evalSignal c b
-evalSignal'' c (SMul a b) = evalSignal c a * evalSignal c b
-evalSignal'' c (SDiv a b) = evalSignal c a / evalSignal c b
-evalSignal'' c (SAp f a) = evalSignal c f $ evalSignal c a
-evalSignal'' c (SFn ix f) = f $ netFnTime c G.! ix
-evalSignal'' c (SInt ix (f :: x -> a)) = f $ unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy :: Proxy x)) (netIntState c)
-evalSignal'' c (SSwitch s _) = evalSignal c s
-evalSignal'' c (SShare s) = evalSignal c s
+evalSignal'' c = go
+    where
+        go :: forall b. Signal t b -> b
+        go (SPure a) = a `seq` a
+        go (SMap f s) = let x = f $! go s in x `seq` x
+        go (SAdd a b) = let x = go a + go b in x `seq` x
+        go (SMul a b) = let x = go a * go b in x `seq` x
+        go (SDiv a b) = let x = go a / go b in x `seq` x
+        go (SAp f a) =
+            let
+                f' = go f
+                a' = go a
+                x = f' a'
+            in x `seq` x
+        go (SFn ix f) = let x = f $! netFnTime c G.! ix in x `seq` x
+        go (SInt ix (f :: x -> b)) = let x = f $! unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy :: Proxy x)) (netIntState c) in x `seq` x
+        go (SSwitch s _) = go s
+        go (SShare s) = go s
 
 evalSignal''' :: forall t o a. Time t => Network t o -> Signal t a -> a
 evalSignal''' c = go
@@ -501,8 +511,36 @@ derivs n h dv =
     in derivsNow n'
 
 derivsNow :: (Time t) => Network t o -> NetStore t
-derivsNow n = G.concat $ map (evalSignal n . snd) $ IntMap.toAscList $ netIntDeriv n
+derivsNow n = G.concat $ parMapChunk (evalSignal n . snd) $ IntMap.toAscList $ netIntDeriv n
 
+-- TODO: Why is this burning so much CPU and not giving me /that/ much of
+-- a speed up. Changing the chunk size doesn't seem to make that much
+-- difference.
+--
+-- 1 -N1  (100% cpu)
+-- real	0m14.623s
+-- user	0m14.458s
+-- sys	0m0.149s
+--
+-- All the rest 580% cpu
+-- 1 -N
+-- real	0m10.852s
+-- user	0m39.608s
+-- sys	0m22.108s
+--
+-- 20 -N
+-- real	0m10.932s
+-- user	0m35.629s
+-- sys	0m23.757s
+--
+-- 200 -N
+-- real	0m11.231s
+-- user	0m37.745s
+-- sys	0m24.182s
+parMapChunk f as =
+    let
+        a = map f as
+    in a `Par.using` Par.parListChunk 1 (Par.rparWith Par.rdeepseq)
 
 -------------------------------------------------------------------
 -- Splat
