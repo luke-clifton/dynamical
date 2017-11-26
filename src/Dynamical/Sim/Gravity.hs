@@ -1,4 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -6,6 +7,7 @@
 {-# LANGUAGE RankNTypes #-}
 module Dynamical.Sim.Gravity where
 
+import qualified Debug.Trace as Dbg
 import Control.Monad.Reader
 import Control.Monad.Writer
 import Data.Map (Map)
@@ -13,6 +15,7 @@ import qualified Data.Map as Map
 import Data.Monoid
 import Dynamical.Sim
 import Linear
+import Data.List
 
 data Body v t = Body
     { bodyPos :: Signal t (v t)
@@ -21,26 +24,21 @@ data Body v t = Body
     , bodyMass:: t
     }
 
-newtype Force v t = Force {toV :: v t}
-    deriving (Show, Eq, Ord, Num, Fractional, Floating, RealFloat, RealFrac, Real)
+type Force v t = v t
 
-instance Num (v t) => Monoid (Force v t) where
-    mempty = 0
-    mappend a b = a + b
-
-makeBody :: (Time t, Splat t (v t), Functor v, Fractional t, Num (v t)) => v t -> v t -> t -> Signal t (Force v t) -> Sim t (Body v t)
+makeBody :: (Time t, Ord (v t), Splat t (v t), Functor v, Fractional t, Num (v t)) => v t -> v t -> t -> Signal t (Force v t) -> Sim t (Body v t)
 makeBody ip iv mass f = do
-    let a = fmap ((^/mass) . toV) f
+    let a = fmap (^/mass) f
     v <- integral iv a
     p <- integral ip v
     return $ Body p v a mass
 
 newtype BodyT k v t m a = BodyT
-    { unBodyT :: ReaderT (Map k (Body v t)) (WriterT (Map k (Signal t (Force v t))) m) a
+    { unBodyT :: ReaderT (Map k (Body v t)) (WriterT [(k, Signal t (Force v t))] m) a
     } deriving (Functor, Applicative, Monad)
 
-applyMempty :: (Ord k, Monoid a) => Map k (a -> b) -> Map k a -> Map k b
-applyMempty = Map.mergeWithKey (\k f a -> Just $ f a) (Map.map ($ mempty)) (const Map.empty)
+applyDefault :: (Ord k) => a -> Map k (a -> b) -> Map k a -> Map k b
+applyDefault d = Map.mergeWithKey (\k f a -> Just $ f a) (Map.map ($ d)) (const Map.empty)
 
 runBody
     :: (Ord k, Num (v t))
@@ -51,13 +49,14 @@ runBody ic (BodyT b) = do
     rec
         (a,fm) <- runWriterT (runReaderT b final)
         let
-            finalSim = applyMempty ic fm
+            finalSim = applyDefault 0 ic $ Map.fromListWith (+) fm
         final <- sequence finalSim
 
     return a
 
-applyForce :: Ord k => k -> Signal t (v t) -> BodyT k v t (Sim t) ()
-applyForce k f = BodyT $ tell (Map.singleton k (Force <$> f))
+applyForce :: (k ~ String, Show (v t), Ord k) => k -> Signal t (v t) -> BodyT k v t (Sim t) ()
+applyForce k@"0_0" f = BodyT $ tell [(k,f)]
+applyForce k f = BodyT $ tell [(k,f)]
 
 getMap :: (Monad m, Ord k) => BodyT k v t m (Map k (Body v t))
 getMap = BodyT ask
@@ -65,7 +64,7 @@ getMap = BodyT ask
 getBody :: (Monad m, Ord k) => k -> BodyT k v t m (Body v t)
 getBody k = BodyT $ asks $ (Map.! k)
 
-gravity :: (Num (v t), Num t, Metric v, Floating t, Ord k) => k -> k -> BodyT k v t (Sim t) ()
+gravity :: (k ~ String, Show (v t), Num (v t), Num t, Metric v, Floating t, Ord k) => k -> k -> BodyT k v t (Sim t) ()
 gravity an bn = do
     a <- getBody an
     b <- getBody bn
@@ -78,11 +77,11 @@ gravity an bn = do
     applyForce an ((*^) <$> f <*> dirA)
     applyForce bn ((*^) <$> f <*> dirB)
 
-nbody :: (Eq k, Ord k, Metric v, Num (v t), Floating t) => Map k (Signal t (Force v t) -> Sim t (Body v t)) -> Sim t (Map k (Body v t))
+nbody :: (k ~ String, Show (v t), Eq k, Ord k, Metric v, Num (v t), Floating t) => Map k (Signal t (Force v t) -> Sim t (Body v t)) -> Sim t (Map k (Body v t))
 nbody ic = runBody ic $ do
     let
         k = Map.keys ic
-        kp = [(a,b) | a <- k, b <- k, a > b]
+        kp = [(a,b) | a <- k, b <- k, a < b]
     mapM_ (uncurry gravity) kp
     getMap
 
@@ -106,9 +105,9 @@ example2 =
             i <- [0..10]
             j <- [0..10]
             let
-                x = 300e6 * fromIntegral i
-                y = 300e6 * fromIntegral j
+                x = fromIntegral i
+                y = fromIntegral j
 
-            return $ (show i ++ "_" ++ show j, makeBody (V2 x y) (V2 0 0) 5e20)
+            return $ (show i ++ "_" ++ show j, makeBody (V2 x y) (V2 (0.02 * sin x) (0.02 * sin y)) 1e6)
     in
         mapToSignal <$> fmap bodyPos <$> nbody ic

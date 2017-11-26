@@ -904,6 +904,8 @@ instance PlotPara (Map String (V2 Double)) where
         let
             ks = Map.keys a
             kk = if length ks > 10 then \_ -> "" else id
+        forM_ a $ \(V2 x y) -> do
+            Chart.plot $ Chart.points "" [(x,y)]
         forM_ ks $ \k -> do
             Chart.plot $ Chart.line (kk k) . (:[]) $ fmap (\(SimResult n t m) ->
                 let

@@ -12,6 +12,7 @@ module Dynamical.Sim
     , Time
     , (:::)(..)
     , threeNames
+    , plotParaSimUntilToFile
     ) where
 
 import Dynamical.Sim.Internal

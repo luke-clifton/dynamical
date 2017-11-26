@@ -49,3 +49,12 @@ executable solar
   main-is: solar.hs
   hs-source-dirs: examples
   ghc-options: -O2 -fllvm
+
+executable nbody
+  build-depends:
+    base,
+    data-default-class,
+    dynamical
+  main-is: nbody.hs
+  hs-source-dirs: examples
+  ghc-options: -O2 -fllvm
