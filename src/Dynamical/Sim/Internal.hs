@@ -540,7 +540,7 @@ derivsNow n = G.concat $ parMapChunk (evalSignal n . snd) $ IntMap.toAscList $ n
 parMapChunk f as =
     let
         a = map f as
-    in a `Par.using` Par.parListChunk 1 (Par.rparWith Par.rdeepseq)
+    in a `Par.using` Par.parListChunk 50 (Par.rdeepseq)
 
 -------------------------------------------------------------------
 -- Splat
