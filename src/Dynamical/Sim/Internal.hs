@@ -68,8 +68,11 @@ import Unsafe.Coerce (unsafeCoerce)
 data Signal t a where
     SPure   :: a -> Signal t a
     SAp     :: Signal t (a -> b) -> Signal t a -> Signal t b
+    SAdd    :: Num a => Signal t a -> Signal t a -> Signal t a
+    SMul    :: Num a => Signal t a -> Signal t a -> Signal t a
+    SDiv    :: Fractional a => Signal t a -> Signal t a -> Signal t a
     SMap    :: (a -> b) -> Signal t a -> Signal t b
-    SInt    :: Splat t a => Int -> Signal t a
+    SInt    :: Splat t a => Int -> (a -> b) -> Signal t b
     SFn     :: Int -> (t -> a) -> Signal t a
     SSwitch :: Signal t a -> Event t (Sim t (Signal t a)) -> Signal t a
     SShare  :: Signal t a -> Signal t a
@@ -79,22 +82,45 @@ instance Monoid a => Monoid (Signal t a) where
     mappend = liftA2 mappend
 
 instance Functor (Signal t) where
-    fmap = SMap
+    fmap f (SMap g s) = SMap (f . g) s
+    fmap f (SInt i g) = SInt i (f . g)
+    fmap f (SPure a) = SPure (f a)
+    -- fmap f (SAp g a) = SAp (fmap (f.) g) a
+    fmap f (SFn i g) = SFn i (f . g)
+    -- fmap f (SSwitch s e) = SSwitch (fmap f s) (fmap (fmap (fmap f)) e)
+    fmap f s = SMap f s
 
 instance Applicative (Signal t) where
     pure = SPure
-    (<*>) = SAp
+    (SPure f) <*> (SPure a) = pure (f a)
+    (SPure f) <*> s = fmap f s
+    a <*> b = SAp a b
+
+dbgSig :: Signal t a -> String
+dbgSig (SPure _) = "SPure"
+dbgSig (SAp a b) = "SAp (" ++ dbgSig a ++ ") (" ++ dbgSig b ++ ")"
+dbgSig (SMap _ s) = "SMap (" ++ dbgSig s ++ ")"
+dbgSig (SInt i _) = "SInt " ++ show i
+dbgSig (SFn i _) = "SFn " ++ show i
+dbgSig (SSwitch s e) = "SSwitch (" ++ dbgSig s ++ ")"
+dbgSig (SShare s) = "SShare (" ++ dbgSig s ++ ")"
+dbgSig (SAdd a b) = "SAdd (" ++ dbgSig a ++ ") (" ++ dbgSig b ++ ")"
+dbgSig (SDiv a b) = "SDiv (" ++ dbgSig a ++ ") (" ++ dbgSig b ++ ")"
+dbgSig (SMul a b) = "SMul (" ++ dbgSig a ++ ") (" ++ dbgSig b ++ ")"
 
 instance Num a => Num (Signal t a) where
     fromInteger = pure . fromInteger
-    (+) = liftA2 (+)
-    (*) = liftA2 (*)
+    (SPure a) + (SPure b) = pure $ a + b
+    a + b = SAdd a b
+    (SPure a) * (SPure b) = pure $ a * b
+    a * b = SMul a b
     abs = fmap abs
     signum = fmap signum
     negate = fmap negate
 
 instance Fractional a => Fractional (Signal t a) where
-    (/) = liftA2 (/)
+    (SPure a) / (SPure b) = pure $ a / b
+    a / b = SDiv a b
     recip = fmap recip
     fromRational = pure . fromRational
 
@@ -210,18 +236,21 @@ gc n@Network{..} =
         findNames s = execState (go s)  mempty
 
         go :: forall a. Signal t a -> State (IntSet, IntSet, IntSet) ()
-        go (SInt ix) = do
+        go (SInt ix (f :: x -> a)) = do
             (i,i',f) <- get
             when (not $ Set.member ix i) $ do
                 let
                     pt = Proxy :: Proxy t
-                    pa = Proxy :: Proxy a
+                    pa = Proxy :: Proxy x
                     len = splen pt pa - 1
                     names = Set.fromList [ix..ix + len]
                 put (i `Set.union` names, Set.insert ix i', f)
                 go (netIntDeriv IntMap.! ix)
         go (SAp a b) = go a >> go b
         go (SMap _ s) = go s
+        go (SAdd a b) = go a >> go b
+        go (SMul a b) = go a >> go b
+        go (SDiv a b) = go a >> go b
         go (SPure _) = return ()
         go (SFn ix _) = modify $ mappend (mempty, mempty, Set.singleton ix)
         go (SSwitch s e) = go s >> goE e
@@ -243,7 +272,7 @@ gc n@Network{..} =
         rename (SAp a b) = SAp (rename a) (rename b)
         rename (SMap f a) = SMap f (rename a)
         rename s@(SPure _) = s
-        rename (SInt ix) = SInt (intMap' IntMap.! ix)
+        rename (SInt ix f) = SInt (intMap' IntMap.! ix) f
         rename (SFn ix f) = SFn (fnMap' IntMap.! ix) f
         rename (SSwitch s e) = SSwitch (rename s) (renameE e)
         rename (SShare s) = SShare (rename s)
@@ -290,11 +319,23 @@ runSwitches' old new =
         go :: Signal t a -> WriterT Any (Sim t) (Signal t a)
         go s@(SPure a) = return s
         go (SMap f s) = go s >>= pure . SMap f
+        go (SAdd a b) = do
+            a' <- go a
+            b' <- go b
+            return $ SAdd a' b'
+        go (SMul a b) = do
+            a' <- go a
+            b' <- go b
+            return $ SMul a' b'
+        go (SDiv a b) = do
+            a' <- go a
+            b' <- go b
+            return $ SDiv a' b'
         go (SAp f a) = do
             f' <- go f
             a' <- go a
             return $ SAp f' a'
-        go s@(SInt ix) = return s
+        go s@(SInt _ _) = return s
         go s@(SFn ix f) = return s
         go (SSwitch s e) = case eventOccured old new e of
             Just v -> tell (Any True) >> lift v
@@ -376,24 +417,39 @@ evalSignal' c me@(SShare s) = do
             put $ IntMap.insert nameh (unsafeCoerce name, unsafeCoerce v') m
             return v'
 evalSignal' c (SPure a) = return a
+evalSignal' c (SAdd a b) = do
+    a' <- evalSignal' c a
+    b' <- evalSignal' c b
+    return $ a' + b'
+evalSignal' c (SMul a b) = do
+    a' <- evalSignal' c a
+    b' <- evalSignal' c b
+    return $ a' * b'
+evalSignal' c (SDiv a b) = do
+    a' <- evalSignal' c a
+    b' <- evalSignal' c b
+    return $ a' / b'
 evalSignal' c (SMap f s) = f <$> evalSignal' c s
 evalSignal' c (SAp f a) = do
     f' <- evalSignal' c f
     a' <- evalSignal' c a
     return $ f' a'
 evalSignal' c (SFn ix f) = return $ f $ netFnTime c G.! ix
-evalSignal' c (SInt ix) = do
+evalSignal' c (SInt ix (f :: x -> a)) = do
     let
-        len = splen (Proxy :: Proxy t) (Proxy :: Proxy a)
-    return $ unsplat $ G.slice ix len (netIntState c)
+        len = splen (Proxy :: Proxy t) (Proxy :: Proxy x)
+    return $ f $ unsplat $ G.slice ix len (netIntState c)
 evalSignal' c (SSwitch s _) = evalSignal' c s
 
 evalSignal'' :: forall t o a. Time t => Network t o -> Signal t a -> a
 evalSignal'' c (SPure a) = a
 evalSignal'' c (SMap f s) = f $ evalSignal c s
+evalSignal'' c (SAdd a b) = evalSignal c a + evalSignal c b
+evalSignal'' c (SMul a b) = evalSignal c a * evalSignal c b
+evalSignal'' c (SDiv a b) = evalSignal c a / evalSignal c b
 evalSignal'' c (SAp f a) = evalSignal c f $ evalSignal c a
 evalSignal'' c (SFn ix f) = f $ netFnTime c G.! ix
-evalSignal'' c (SInt ix) = unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy :: Proxy a)) (netIntState c)
+evalSignal'' c (SInt ix (f :: x -> a)) = f $ unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy :: Proxy x)) (netIntState c)
 evalSignal'' c (SSwitch s _) = evalSignal c s
 evalSignal'' c (SShare s) = evalSignal c s
 
@@ -406,9 +462,12 @@ evalSignal''' c = go
         gogo :: forall b. Signal t b -> b
         gogo (SPure a) = a
         gogo (SMap f s) = f $ go s
+        gogo (SAdd a b) = go a + go b
+        gogo (SMul a b) = go a * go b
+        gogo (SDiv a b) = go a / go b
         gogo (SAp f a) = go f $ go a
         gogo (SFn ix f) = f $ netFnTime c G.! ix
-        gogo (SInt ix) = unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy :: Proxy b)) (netIntState c)
+        gogo (SInt ix (f :: x -> b)) = f $ unsplat $ G.slice ix (splen (Proxy :: Proxy t) (Proxy :: Proxy x)) (netIntState c)
         gogo (SSwitch s _) = go s
         gogo (SShare s) = go s
 
@@ -514,7 +573,7 @@ integral i s = Sim $ do
         { netIntState = netIntState st G.++ sp
         , netIntDeriv = IntMap.insert ix (fmap splat s) (netIntDeriv st)
         }
-    return $ SInt ix
+    return $ SInt ix id
 
 -- | Create a `Signal` that is a pure function of time. Each `timeFn'` has
 -- a local concept of time, and this time starts from the provided time
